@@ -305,42 +305,60 @@ usb_storage(){
 }
 
 # ============================================================
-#  МОДУЛЬ 3: мережеві інтерфейси + bridge
+#  МОДУЛЬ 3: LAN bridge для OPNsense
+#  Існуючий інтерфейс (з uplink) = WAN, новий bridge = LAN.
+#  LAN-bridge БЕЗ IP на хості — OPNsense роутить і роздає DHCP.
 # ============================================================
 network_bridge(){
   echo
-  echo "${BLD}=== Мережеві інтерфейси / bridge ===${RST}"
+  echo "${BLD}=== LAN bridge для OPNsense ===${RST}"
+  info "Логіка: наявний інтерфейс = ${BLD}WAN${RST}, новий bridge = ${BLD}LAN${RST}."
+  info "LAN-bridge лишається без IP на хості — адресацію тримає OPNsense."
 
-  echo
-  echo "Фізичні інтерфейси:"
-  ip -br link show | awk '$1 !~ /^(lo|vmbr|veth|tap|fwln|fwpr|fwbr|bond)/'
+  # --- визначити WAN (звідки йде uplink хоста) ---
+  local wan_dev wan_br
+  wan_dev="$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+  if [[ -n "$wan_dev" ]]; then
+    if [[ "$wan_dev" == vmbr* ]]; then
+      wan_br="$wan_dev"
+      # фізичний порт цього bridge
+      local wp; wp="$(ls /sys/class/net/"$wan_br"/brif 2>/dev/null | head -n1)"
+      info "WAN uplink: ${BLD}${wan_br}${RST} (порт: ${wp:-?}) — це буде net0/WAN у OPNsense."
+    else
+      wan_br="$wan_dev"
+      info "WAN uplink: ${BLD}${wan_dev}${RST} (не bridge)."
+    fi
+  else
+    warn "Не визначив default route — WAN вкажеш вручну в OPNsense."
+  fi
+
   echo
   echo "Наявні bridge:"
   ip -br link show type bridge 2>/dev/null || true
   echo
 
-  # знайти вільні фізичні NIC: без IP і не в жодному bridge
+  # --- знайти вільні фізичні NIC (кандидати на LAN): без IP, не в bridge ---
   local -a free=()
   local ifc
   while read -r ifc; do
     [[ "$ifc" =~ ^(lo|vmbr|veth|tap|fwbr|fwln|fwpr|bond|dummy) ]] && continue
-    # тільки реальні ethernet
-    [[ -e "/sys/class/net/$ifc/device" ]] || continue
-    # має IP?
+    [[ -e "/sys/class/net/$ifc/device" ]] || continue                 # реальний ethernet
+    [[ "$ifc" == "$wan_dev" ]] && continue                            # не чіпати WAN-порт
     if ip -4 addr show "$ifc" 2>/dev/null | grep -q 'inet '; then continue; fi
-    # уже член bridge?
     if [[ -n "$(ls /sys/class/net/*/brif/"$ifc" 2>/dev/null)" ]]; then continue; fi
-    # згаданий у /etc/network/interfaces як bridge-port?
     if grep -qE "bridge-ports.*\b${ifc}\b" /etc/network/interfaces 2>/dev/null; then continue; fi
     free+=("$ifc")
   done < <(ls /sys/class/net)
 
   if [[ ${#free[@]} -eq 0 ]]; then
-    warn "Вільних фізичних інтерфейсів немає — bridge не створюю."
+    warn "Вільних фізичних інтерфейсів під LAN немає."
+    warn "Варіант: LAN як internal-only bridge (без фізичного порту) для VM-only мережі."
+    confirm "Створити LAN-bridge БЕЗ фізичного порту (internal)?" || { warn "Пропущено."; return 0; }
+    _make_lan_bridge "" "$wan_br"
     return 0
   fi
 
-  echo "Вільні інтерфейси (без IP, не в bridge):"
+  echo "Вільні інтерфейси (кандидати на LAN-порт):"
   local n=0
   for ifc in "${free[@]}"; do
     local st; st="$(cat /sys/class/net/"$ifc"/operstate 2>/dev/null || echo '?')"
@@ -348,55 +366,45 @@ network_bridge(){
     ((n++))
   done
   echo
-  confirm "Створити новий bridge на вільному інтерфейсі?" || { warn "Пропущено."; return 0; }
+  confirm "Створити LAN-bridge для OPNsense?" || { warn "Пропущено."; return 0; }
 
   local sel
-  read -rp "Який інтерфейс? [0] " sel || true; sel="${sel:-0}"
+  read -rp "Який інтерфейс як LAN-порт? [0] " sel || true; sel="${sel:-0}"
   [[ "$sel" =~ ^[0-9]+$ && $sel -lt $n ]] || die "Невірний вибір."
-  local port="${free[$sel]}"
+  _make_lan_bridge "${free[$sel]}" "$wan_br"
+}
+
+# створити LAN-bridge; $1=фізичний порт (порожньо=internal), $2=wan_br для підсумку
+_make_lan_bridge(){
+  local port="$1" wan_br="$2"
 
   # наступний вільний vmbrN
   local idx=0
   while ip link show "vmbr${idx}" >/dev/null 2>&1; do ((idx++)); done
   local br="vmbr${idx}"
-  info "Створюю ${BLD}${br}${RST} з портом ${BLD}${port}${RST}"
-
-  # IP-налаштування bridge
-  local mode ipcidr gw
-  echo "Режим IP для ${br}: 1) manual (без IP, чистий L2)  2) static  3) dhcp"
-  read -rp "Вибір [1]: " mode || true; mode="${mode:-1}"
+  info "Створюю LAN-bridge ${BLD}${br}${RST}${port:+ з портом ${BLD}${port}${RST}}"
 
   cp -a /etc/network/interfaces "/etc/network/interfaces.bak.$(date +%s)"
   {
     echo ""
-    echo "auto ${port}"
-    echo "iface ${port} inet manual"
-    echo ""
+    echo "# --- OPNsense LAN (створено pve-setup.sh) ---"
+    if [[ -n "$port" ]]; then
+      echo "auto ${port}"
+      echo "iface ${port} inet manual"
+      echo ""
+    fi
     echo "auto ${br}"
-    case "$mode" in
-      2)
-        read -rp "IP/CIDR (напр. 192.168.1.10/24): " ipcidr
-        read -rp "Gateway (Enter якщо нема): " gw
-        echo "iface ${br} inet static"
-        echo "        address ${ipcidr}"
-        [[ -n "$gw" ]] && echo "        gateway ${gw}"
-        ;;
-      3)
-        echo "iface ${br} inet dhcp"
-        ;;
-      *)
-        echo "iface ${br} inet manual"
-        ;;
-    esac
-    echo "        bridge-ports ${port}"
+    echo "iface ${br} inet manual"          # без IP на хості — тримає OPNsense
+    echo "        bridge-ports ${port:-none}"
     echo "        bridge-stp off"
     echo "        bridge-fd 0"
+    echo "#         LAN bridge для OPNsense — приєднай як net1/LAN у VM"
   } >> /etc/network/interfaces
 
-  ok "Додано ${br} у /etc/network/interfaces (бекап збережено)."
+  ok "Додано LAN-bridge ${br} у /etc/network/interfaces (бекап збережено, без IP на хості)."
   echo
   info "Застосувати зараз через 'ifreload -a'?"
-  warn "Якщо мережа хоста йде через цей інтерфейс — можлива втрата зв'язку."
+  warn "WAN-зв'язок хоста не чіпається (LAN-порт окремий)."
   if confirm "Виконати ifreload -a?"; then
     if command -v ifreload >/dev/null 2>&1; then
       ifreload -a && ok "Мережу перезавантажено."
@@ -406,7 +414,13 @@ network_bridge(){
   else
     warn "Не застосовано. Застосуй пізніше: ifreload -a"
   fi
-  ip -br addr show "$br" || true
+
+  echo
+  echo "${BLD}Мапа для OPNsense VM:${RST}"
+  echo "   net0 (WAN) → ${wan_br:-<твій WAN bridge>}"
+  echo "   net1 (LAN) → ${br}"
+  echo "   У VM conf: net0=virtio,bridge=${wan_br:-vmbr0}  net1=virtio,bridge=${br}"
+  echo "   Після інсталяції OPNsense признач: WAN=vtnet0, LAN=vtnet1."
 }
 
 # ============================================================
@@ -707,7 +721,7 @@ show_menu(){
   echo "  1) Post-install (repo + nag + upgrade)"
   echo "  2) GPU passthrough (Intel iGPU пріоритет)"
   echo "  3) USB storage (exFAT)"
-  echo "  4) Мережевий bridge"
+  echo "  4) LAN bridge для OPNsense"
   echo "  5) Кнопка живлення → reboot VM"
   echo "  6) Debian VM (актуальний ISO + створення)"
   echo "  7) Перевірка IOMMU-груп (чистота GPU)"

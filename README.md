@@ -6,7 +6,7 @@
 1. **Post-install** — вимкнути enterprise repo, ввімкнути `no-subscription`, прибрати "No valid subscription" nag, `apt dist-upgrade`.
 2. **GPU passthrough** — детект GPU на хості, пріоритет Intel iGPU, IOMMU + vfio-pci + blacklist драйвера, звільнення framebuffer хоста для Intel. Автовизначення bootloader (GRUB / systemd-boot).
 3. **USB storage (exFAT)** — детект флешки, форматування в exFAT якщо інший FS, монтування по UUID з `nofail`, додавання Proxmox directory storage (`content=backup`).
-4. **Мережевий bridge** — пошук вільного фізичного інтерфейсу, створення `vmbrN` (manual / static / dhcp).
+4. **LAN bridge для OPNsense** — наявний uplink-інтерфейс = WAN, новий bridge на вільному NIC = LAN (без IP на хості — адресацію тримає OPNsense). Виводить мапу net0=WAN / net1=LAN для VM. Якщо вільного NIC нема — internal-only bridge для VM-мережі.
 5. **Кнопка живлення → reboot VM** — хост ігнорує power-key, acpid ловить подію → `qm reboot <VMID>`.
 6. **Debian VM** — знайти й завантажити актуальний netinst ISO, створити VM (q35, cpu host, 4 ядра, 8 GB ОЗУ, 10 GB диск, virtio, без autostart).
 7. **Перевірка IOMMU-груп** — чи GPU у чистій групі (без чужих пристроїв) для безпечного passthrough.
