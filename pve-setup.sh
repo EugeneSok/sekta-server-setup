@@ -112,7 +112,7 @@ gpu_passthrough(){
   )
   [[ ${#gpu_lines[@]} -gt 0 ]] || die "GPU не знайдено (lspci)."
 
-  local -a G_ADDR G_IDS G_DESC G_IGPU G_DRV
+  local -a G_ADDR G_IDS G_DESC G_IGPU
   local i=0 default_idx=-1
   echo
   echo "Знайдені GPU:"
@@ -128,7 +128,7 @@ gpu_passthrough(){
        && grep -qE ':0[0-2]\.' <<<"$addr"; then
       igpu="yes"
     fi
-    G_ADDR[i]="$addr"; G_IDS[i]="$ids"; G_DESC[i]="$desc"; G_IGPU[i]="$igpu"; G_DRV[i]="$drv"
+    G_ADDR[i]="$addr"; G_IDS[i]="$ids"; G_DESC[i]="$desc"; G_IGPU[i]="$igpu"
     local tag=""; [[ "$igpu" == "yes" ]] && { tag=" ${GRN}[iGPU]${RST}"; [[ $default_idx -lt 0 ]] && default_idx=$i; }
     printf "  ${BLD}%d${RST}) %s  ids=%s  driver=%s%s\n" "$i" "$desc" "$ids" "$drv" "$tag"
     ((i++))
@@ -289,7 +289,7 @@ usb_storage(){
 
   info "Перевірка: mount -a…"
   mount -a
-  mountpoint -q "$mnt" && ok "Змонтовано на ${mnt}" || warn "Не змонтувалось — перевір вручну."
+  if mountpoint -q "$mnt"; then ok "Змонтовано на ${mnt}"; else warn "Не змонтувалось — перевір вручну."; fi
   ls -lh "$mnt" || true
 
   # додати як Proxmox storage
@@ -322,7 +322,7 @@ network_bridge(){
     if [[ "$wan_dev" == vmbr* ]]; then
       wan_br="$wan_dev"
       # фізичний порт цього bridge
-      local wp; wp="$(ls /sys/class/net/"$wan_br"/brif 2>/dev/null | head -n1)"
+      local wp; wp="$(find /sys/class/net/"$wan_br"/brif -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | head -n1)"
       info "WAN uplink: ${BLD}${wan_br}${RST} (порт: ${wp:-?}) — це буде net0/WAN у OPNsense."
     else
       wan_br="$wan_dev"
@@ -503,16 +503,16 @@ post_install(){
 
   # codename Debian під версію PVE (bookworm=PVE8, trixie=PVE9)
   local codename
+  # shellcheck disable=SC1091  # /etc/os-release існує лише на цільовому хості
   codename="$(. /etc/os-release; echo "${VERSION_CODENAME:-bookworm}")"
   info "Debian codename: ${codename}"
 
   # --- 1. вимкнути enterprise repo (формати .list і deb822 .sources) ---
-  local changed=0
   for f in /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/ceph.list; do
     if [[ -f "$f" ]] && grep -qE '^\s*deb ' "$f"; then
       cp -a "$f" "${f}.bak.$(date +%s)"
       sed -i 's|^\s*deb |# deb |' "$f"
-      ok "Вимкнено enterprise repo: $f"; changed=1
+      ok "Вимкнено enterprise repo: $f"
     fi
   done
   for f in /etc/apt/sources.list.d/pve-enterprise.sources /etc/apt/sources.list.d/ceph.sources; do
@@ -523,7 +523,7 @@ post_install(){
       else
         echo "Enabled: false" >> "$f"
       fi
-      ok "Вимкнено enterprise repo (deb822): $f"; changed=1
+      ok "Вимкнено enterprise repo (deb822): $f"
     fi
   done
 
@@ -531,7 +531,7 @@ post_install(){
   local nosub=/etc/apt/sources.list.d/pve-no-subscription.list
   if [[ ! -f "$nosub" ]] || ! grep -q 'pve-no-subscription' "$nosub"; then
     echo "deb http://download.proxmox.com/debian/pve ${codename} pve-no-subscription" > "$nosub"
-    ok "Додано no-subscription repo → $nosub"; changed=1
+    ok "Додано no-subscription repo → $nosub"
   else
     ok "no-subscription repo вже є."
   fi
