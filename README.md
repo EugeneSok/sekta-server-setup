@@ -13,6 +13,27 @@
 8. **Debian VM** — знайти й завантажити актуальний netinst ISO, створити VM (q35, cpu host, 4 ядра, 8 GB ОЗУ, 10 GB диск, virtio, без autostart).
 9. **Кнопка живлення → reboot VM** — хост ігнорує power-key, acpid ловить подію → `qm reboot <VMID>`.
 
+## Мінімальні вимоги заліза
+
+Розраховано на повний стек (host + OPNsense + Pi-hole + Debian VM одночасно).
+
+| Компонент | Мінімум | Рекомендовано |
+|---|---|---|
+| **CPU** | x86-64, 4 потоки, VT-x / AMD-V | 6+ потоків |
+| **IOMMU** | VT-d / AMD-Vi у BIOS (для GPU passthrough) | — |
+| **RAM** | 8 GB (без Debian VM) | 16 GB+ |
+| **Диск** | 64 GB SSD | 128 GB+ NVMe |
+| **NIC** | 1 (LAN як internal/VLAN) | 2 фізичні (WAN + LAN) |
+| **USB** | флешка під бекапи (модуль 4) | — |
+| **GPU** | лише якщо треба passthrough (модуль 2) | iGPU/dGPU з підтримкою VFIO |
+
+Орієнтовний розподіл RAM/диску: host ~2 GB / 16 GB, OPNsense 2 GB / 20 GB, Pi-hole 0.5 GB / 8 GB, Debian VM 8 GB / 10 GB.
+
+Примітки:
+- Для **GPU passthrough** обовʼязково увімкнути VT-d/IOMMU у BIOS/UEFI, інакше модулі 2/3 не спрацюють.
+- Для **OPNsense з реальним WAN** потрібні 2 фізичні NIC (або 1 NIC + VLAN-tagging на керованому світчі).
+- Без Debian VM (модуль 8) вимоги падають: 8 GB RAM і 64 GB диску вистачає для host + OPNsense + Pi-hole.
+
 ## Запуск
 
 На хості Proxmox під **root**:
