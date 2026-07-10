@@ -699,11 +699,11 @@ GPU_NEEDS_REBOOT=0
 show_menu(){
   echo
   echo "${BLD}=== Інтерактивне налаштування сервера Sekta ===${RST}"
-  echo "  1) GPU passthrough (Intel iGPU пріоритет)"
-  echo "  2) USB storage (exFAT)"
-  echo "  3) Мережевий bridge"
-  echo "  4) Кнопка живлення → reboot VM"
-  echo "  5) Post-install (repo + nag + upgrade)"
+  echo "  1) Post-install (repo + nag + upgrade)"
+  echo "  2) GPU passthrough (Intel iGPU пріоритет)"
+  echo "  3) USB storage (exFAT)"
+  echo "  4) Мережевий bridge"
+  echo "  5) Кнопка живлення → reboot VM"
   echo "  6) Debian VM (актуальний ISO + створення)"
   echo "  7) Перевірка IOMMU-груп (чистота GPU)"
   echo "  q) Вихід"
@@ -731,11 +731,11 @@ main(){
     local ch
     read -rp "Вибір: " ch || { finish; }
     case "$ch" in
-      1) gpu_passthrough ;;
-      2) usb_storage ;;
-      3) network_bridge ;;
-      4) power_button_vm ;;
-      5) post_install ;;
+      1) post_install ;;
+      2) gpu_passthrough ;;
+      3) usb_storage ;;
+      4) network_bridge ;;
+      5) power_button_vm ;;
       6) debian_vm ;;
       7) iommu_check ;;
       q|Q) finish ;;
