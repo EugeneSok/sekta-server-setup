@@ -818,6 +818,135 @@ opnsense_vm(){
 }
 
 # ============================================================
+#  МОДУЛЬ 9: LXC з Pi-hole
+# ============================================================
+pihole_lxc(){
+  echo
+  echo "${BLD}=== LXC Pi-hole ===${RST}"
+  command -v pct >/dev/null 2>&1 || die "pct не знайдено — не хост Proxmox."
+
+  # --- шаблон Debian 12 ---
+  local tstore
+  tstore="$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1{print $1}' | grep -x local || \
+            pvesm status -content vztmpl 2>/dev/null | awk 'NR>1{print $1; exit}')"
+  [[ -n "$tstore" ]] || die "Немає storage з content=vztmpl."
+  info "pveam update…"; pveam update >/dev/null 2>&1 || true
+  local tmpl
+  tmpl="$(pveam available --section system 2>/dev/null | awk '/debian-12-standard/{print $2}' | sort -V | tail -n1)"
+  [[ -n "$tmpl" ]] || die "Не знайшов шаблон debian-12-standard."
+  if pveam list "$tstore" 2>/dev/null | grep -q "$tmpl"; then
+    ok "Шаблон вже є: $tmpl"
+  else
+    confirm "Завантажити шаблон ${tmpl}?" || { warn "Скасовано."; return 0; }
+    pveam download "$tstore" "$tmpl"
+  fi
+  local tmpl_ref="${tstore}:vztmpl/${tmpl}"
+
+  # --- storage для rootfs ---
+  local rootstore
+  rootstore="$(pvesm status -content rootdir 2>/dev/null | awk 'NR>1{print $1}' | grep -x local-lvm || \
+               pvesm status -content rootdir 2>/dev/null | awk 'NR>1{print $1; exit}')"
+  [[ -n "$rootstore" ]] || die "Немає storage з content=rootdir."
+  read -rp "Storage для rootfs [${rootstore}]: " s || true; rootstore="${s:-$rootstore}"
+
+  # --- bridge (за замовч. LAN = не-WAN) ---
+  local wan_br lan_br
+  wan_br="$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+  lan_br="$(ip -br link show type bridge 2>/dev/null | awk '{print $1}' | grep -v "^${wan_br}$" | head -n1)"
+  [[ -n "$lan_br" ]] || lan_br="${wan_br:-vmbr0}"
+  echo "Наявні bridge:"; ip -br link show type bridge 2>/dev/null | awk '{print "   "$1}'
+  read -rp "Bridge для Pi-hole (LAN) [${lan_br}]: " b || true; lan_br="${b:-$lan_br}"
+
+  # --- IP: static рекомендовано для DNS ---
+  local netcfg ip4=""
+  echo "Мережа: 1) static (рекомендовано для DNS)  2) dhcp"
+  local nm; read -rp "Вибір [1]: " nm || true; nm="${nm:-1}"
+  if [[ "$nm" == "2" ]]; then
+    netcfg="name=eth0,bridge=${lan_br},ip=dhcp"
+    warn "DHCP: IP заздалегідь невідомий. Для DNS краще static/резервація."
+  else
+    local ipc gw
+    read -rp "IP/CIDR (напр. 192.168.1.2/24): " ipc
+    [[ "$ipc" =~ ^[0-9.]+/[0-9]+$ ]] || die "Невірний формат IP/CIDR."
+    read -rp "Gateway (напр. 192.168.1.1 = OPNsense LAN): " gw
+    netcfg="name=eth0,bridge=${lan_br},ip=${ipc},gw=${gw}"
+    ip4="${ipc%%/*}"
+  fi
+
+  # --- VMID (дефолт 501) ---
+  local vmid=501
+  if pct status "$vmid" >/dev/null 2>&1 || qm status "$vmid" >/dev/null 2>&1; then
+    vmid="$(pvesh get /cluster/nextid 2>/dev/null || echo 502)"
+    warn "501 зайнятий → ${vmid}."
+  fi
+  read -rp "CTID [${vmid}]: " v || true; vmid="${v:-$vmid}"
+  { pct status "$vmid" >/dev/null 2>&1 || qm status "$vmid" >/dev/null 2>&1; } && die "ID ${vmid} вже існує."
+
+  # --- пароль web ---
+  local wpass
+  read -rsp "Пароль web-адмінки Pi-hole (Enter = без пароля): " wpass || true; echo
+
+  echo
+  info "Параметри LXC Pi-hole:"
+  echo "    CTID=${vmid} hostname=pihole  unprivileged=1"
+  echo "    cores=1 memory=512MB swap=512MB rootfs=8G@${rootstore}"
+  echo "    net=${netcfg}"
+  confirm "Створити контейнер?" || { warn "Скасовано."; return 0; }
+
+  pct create "$vmid" "$tmpl_ref" \
+    --hostname pihole \
+    --cores 1 \
+    --memory 512 --swap 512 \
+    --rootfs "${rootstore}:8" \
+    --net0 "$netcfg" \
+    --ostype debian \
+    --unprivileged 1 \
+    --features nesting=1 \
+    --onboot 1
+  ok "Контейнер ${vmid} створено."
+
+  info "Старт контейнера…"
+  pct start "$vmid"
+  sleep 5
+
+  # чекаємо мережу
+  info "Готую систему (apt + curl)…"
+  pct exec "$vmid" -- bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y curl ca-certificates >/dev/null" || \
+    warn "apt не завершився чисто — перевір мережу контейнера."
+
+  # unattended setupVars
+  info "Розгортаю Pi-hole (unattended)…"
+  pct exec "$vmid" -- bash -c "mkdir -p /etc/pihole && cat > /etc/pihole/setupVars.conf <<'EOF'
+PIHOLE_INTERFACE=eth0
+PIHOLE_DNS_1=1.1.1.1
+PIHOLE_DNS_2=1.0.0.1
+QUERY_LOGGING=true
+INSTALL_WEB_SERVER=true
+INSTALL_WEB_INTERFACE=true
+LIGHTTPD_ENABLED=true
+DNSMASQ_LISTENING=local
+IPV4_ADDRESS=${ip4:+${ip4}/24}
+IPV6_ADDRESS=
+BLOCKING_ENABLED=true
+EOF"
+  pct exec "$vmid" -- bash -c "curl -sSL https://install.pi-hole.net | bash /dev/stdin --unattended" || \
+    warn "Інсталятор Pi-hole завершився з помилкою — глянь: pct exec ${vmid} -- pihole -v"
+
+  # пароль (v6: setpassword, v5: -a -p)
+  if [[ -n "$wpass" ]]; then
+    pct exec "$vmid" -- bash -c "pihole setpassword '${wpass}' 2>/dev/null || pihole -a -p '${wpass}'" || \
+      warn "Не вдалось встановити пароль — зроби вручну: pct exec ${vmid} -- pihole setpassword"
+  fi
+
+  echo
+  ok "Pi-hole готовий у CT ${vmid}."
+  local shown="${ip4:-<DHCP-IP: pct exec ${vmid} -- hostname -I>}"
+  echo "    Web:  http://${shown}/admin"
+  echo "    DNS:  ${shown}  → пропиши цей IP як DNS у OPNsense/DHCP клієнтам"
+  [[ -z "$wpass" ]] && warn "Пароль не заданий. Встанови: pct exec ${vmid} -- pihole setpassword"
+}
+
+# ============================================================
 #  MAIN
 # ============================================================
 GPU_NEEDS_REBOOT=0
@@ -833,6 +962,7 @@ show_menu(){
   echo "  6) Debian VM (актуальний ISO + створення)"
   echo "  7) Перевірка IOMMU-груп (чистота GPU)"
   echo "  8) OPNsense VM (WAN + LAN)"
+  echo "  9) LXC Pi-hole (DNS-фільтр)"
   echo "  q) Вихід"
   [[ "$GPU_NEEDS_REBOOT" == "1" ]] && echo "  ${YEL}* очікує REBOOT для застосування GPU passthrough${RST}"
   echo
@@ -866,6 +996,7 @@ main(){
       6) debian_vm ;;
       7) iommu_check ;;
       8) opnsense_vm ;;
+      9) pihole_lxc ;;
       q|Q) finish ;;
       *) warn "Невірний вибір: '$ch'"; continue ;;
     esac
