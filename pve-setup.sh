@@ -29,6 +29,10 @@ confirm(){
 
 need_root(){ [[ $EUID -eq 0 ]] || die "Запусти під root."; }
 
+# джерело kiosk-інсталятора (окремий репо debian-kiosk-splash)
+KIOSK_RAW="https://raw.githubusercontent.com/EugeneSok/debian-kiosk-splash/main"
+KIOSK_DEFAULT_URL="https://combat.omega"
+
 check_pve(){
   if ! command -v pveversion >/dev/null 2>&1; then
     warn "pveversion не знайдено — це схоже НЕ хост Proxmox."
@@ -947,6 +951,61 @@ EOF"
 }
 
 # ============================================================
+#  МОДУЛЬ 10: Kiosk-дисплей (Plymouth splash + Chromium kiosk)
+#  Ставиться на ОКРЕМУ машину-дисплей (Debian/RPi), НЕ на PVE-хост.
+#  Тягне інсталятор debian-kiosk-splash і запускає його від звичайного
+#  користувача (інсталятор відмовляється працювати під root).
+# ============================================================
+kiosk_display(){
+  echo
+  echo "${BLD}=== Kiosk-дисплей (Chromium + boot splash) ===${RST}"
+  warn "Цей модуль — для ${BLD}машини-дисплея${RST} (Debian / Raspberry Pi OS),"
+  warn "а не для PVE-хоста. Запускай його на самому дисплеї."
+  info "Ставить: Plymouth boot-splash з логотипом SEKTA + Chromium у режимі"
+  info "kiosk (systemd --user unit), що відкриває заданий дашборд на весь екран."
+  echo
+
+  # інсталятор тягне install.sh + ассети з інтернету
+  if ! curl -fsI "${KIOSK_RAW}/install.sh" >/dev/null 2>&1; then
+    warn "Немає доступу до ${KIOSK_RAW} — потрібен інтернет."
+    confirm "Все одно спробувати?" || { warn "Пропущено."; return 0; }
+  fi
+
+  # URL дашборда, який відкриє kiosk
+  local url
+  read -rp "URL, який відкривати в kiosk [${KIOSK_DEFAULT_URL}]: " url || true
+  url="${url:-$KIOSK_DEFAULT_URL}"
+
+  # інсталятор ВІДМОВЛЯЄТЬСЯ від root → запускаємо від звичайного користувача
+  local runas="${SUDO_USER:-}"
+  if [[ $EUID -eq 0 && -z "$runas" ]]; then
+    read -rp "Користувач дисплея (він має мати sudo): " runas || true
+    [[ -n "$runas" ]] || { err "Потрібен звичайний користувач — kiosk не ставиться під root."; return 0; }
+  fi
+  if [[ -n "$runas" ]] && ! id "$runas" >/dev/null 2>&1; then
+    die "Користувача '$runas' не існує."
+  fi
+
+  echo
+  warn "Kiosk відкриє: ${BLD}${url}${RST}"
+  [[ -n "$runas" ]] && info "Запуск від користувача: ${BLD}${runas}${RST}"
+  confirm "Встановити kiosk зараз?" || { warn "Скасовано."; return 0; }
+
+  # завантажити інсталятор і виконати від цільового користувача
+  local tmp; tmp="$(mktemp)"
+  curl -fsSL "${KIOSK_RAW}/install.sh" -o "$tmp" || { rm -f "$tmp"; die "Не завантажив install.sh."; }
+  if [[ -n "$runas" ]]; then
+    sudo -u "$runas" KIOSK_URL="$url" bash "$tmp"
+  else
+    KIOSK_URL="$url" bash "$tmp"
+  fi
+  rm -f "$tmp"
+  echo
+  ok "Kiosk-модуль завершено."
+  info "Джерело: github.com/EugeneSok/debian-kiosk-splash"
+}
+
+# ============================================================
 #  MAIN
 # ============================================================
 GPU_NEEDS_REBOOT=0
@@ -963,6 +1022,7 @@ show_menu(){
   echo "  7) LXC Pi-hole (DNS-фільтр)"
   echo "  8) Debian VM (актуальний ISO + створення)"
   echo "  9) Кнопка живлення → reboot VM"
+  echo "  10) Kiosk-дисплей (Chromium + boot splash) — на машині-дисплеї"
   echo "  q) Вихід"
   [[ "$GPU_NEEDS_REBOOT" == "1" ]] && echo "  ${YEL}* очікує REBOOT для застосування GPU passthrough${RST}"
   echo
@@ -997,6 +1057,7 @@ main(){
       7) pihole_lxc ;;
       8) debian_vm ;;
       9) power_button_vm ;;
+      10) kiosk_display ;;
       q|Q) finish ;;
       *) warn "Невірний вибір: '$ch'"; continue ;;
     esac
