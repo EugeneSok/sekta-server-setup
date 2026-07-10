@@ -591,8 +591,13 @@ debian_vm(){
   ip link show vmbr0 >/dev/null 2>&1 || br="$(ip -br link show type bridge | awk 'NR==1{print $1}')"
   read -rp "Bridge для мережі [${br}]: " b || true; br="${b:-$br}"
 
-  # --- VMID ---
-  local vmid; vmid="$(pvesh get /cluster/nextid 2>/dev/null || echo 100)"
+  # --- VMID (дефолт 500) ---
+  local vmid=500
+  if qm status "$vmid" >/dev/null 2>&1; then
+    local nextid; nextid="$(pvesh get /cluster/nextid 2>/dev/null || echo 501)"
+    warn "VMID 500 вже зайнятий. Пропоную ${nextid}."
+    vmid="$nextid"
+  fi
   read -rp "VMID [${vmid}]: " v || true; vmid="${v:-$vmid}"
   qm status "$vmid" >/dev/null 2>&1 && die "VM ${vmid} вже існує."
 
