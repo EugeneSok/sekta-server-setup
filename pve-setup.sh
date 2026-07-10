@@ -711,6 +711,113 @@ iommu_check(){
 }
 
 # ============================================================
+#  МОДУЛЬ 8: OPNsense VM (WAN+LAN, dvd ISO)
+# ============================================================
+opnsense_vm(){
+  echo
+  echo "${BLD}=== OPNsense VM (WAN + LAN) ===${RST}"
+  command -v qm >/dev/null 2>&1 || die "qm не знайдено — не хост Proxmox."
+
+  # --- знайти актуальний dvd ISO на дзеркалі ---
+  local mirror="${OPN_MIRROR:-https://mirror.dns-root.de/opnsense/releases/mirror/}"
+  info "Дзеркало OPNsense: ${mirror}"
+  local bz
+  bz="$(curl -fsSL "$mirror" 2>/dev/null | grep -oE 'OPNsense-[0-9.]+-dvd-amd64\.iso\.bz2' | sort -Vu | tail -n1 || true)"
+  local url
+  if [[ -n "$bz" ]]; then
+    url="${mirror}${bz}"
+    info "Знайдено: ${BLD}${bz}${RST}"
+  else
+    warn "Автопошук ISO не вдався."
+    read -rp "Встав пряме посилання на OPNsense dvd .iso.bz2: " url || true
+    [[ -n "$url" ]] || die "Немає URL ISO."
+    bz="$(basename "$url")"
+  fi
+
+  # --- завантажити + розпакувати в ISO storage ---
+  local isodir=/var/lib/vz/template/iso
+  mkdir -p "$isodir"
+  local iso="${bz%.bz2}"
+  local isopath="${isodir}/${iso}"
+  if [[ -f "$isopath" ]]; then
+    ok "ISO вже готовий: $isopath"
+  else
+    confirm "Завантажити й розпакувати ${bz}?" || { warn "Скасовано."; return 0; }
+    command -v bunzip2 >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y bzip2; }
+    info "Завантаження…"
+    curl -fL --progress-bar -o "${isodir}/${bz}" "$url"
+    info "Розпаковка bz2…"
+    bunzip2 -f "${isodir}/${bz}"
+    [[ -f "$isopath" ]] || die "Після розпаковки нема ${isopath}."
+    ok "ISO готовий: $isopath"
+  fi
+  local iso_ref="local:iso/${iso}"
+
+  # --- storage диска ---
+  local diskstore
+  diskstore="$(pvesm status -content images 2>/dev/null | awk 'NR>1{print $1}' | grep -x local-lvm || \
+               pvesm status -content images 2>/dev/null | awk 'NR>1{print $1; exit}')"
+  [[ -n "$diskstore" ]] || die "Немає storage з content=images."
+  read -rp "Storage для диска [${diskstore}]: " s || true; diskstore="${s:-$diskstore}"
+
+  # --- WAN bridge (default route) ---
+  local wan_br
+  wan_br="$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+  [[ "$wan_br" == vmbr* ]] || wan_br=vmbr0
+  read -rp "WAN bridge (net0) [${wan_br}]: " w || true; wan_br="${w:-$wan_br}"
+
+  # --- LAN bridge: показати bridge крім WAN ---
+  echo "Наявні bridge:"
+  ip -br link show type bridge 2>/dev/null | awk '{print "   "$1}'
+  local lan_br
+  lan_br="$(ip -br link show type bridge 2>/dev/null | awk '{print $1}' | grep -v "^${wan_br}$" | head -n1)"
+  [[ -n "$lan_br" ]] || lan_br=vmbr1
+  read -rp "LAN bridge (net1) [${lan_br}]: " l || true; lan_br="${l:-$lan_br}"
+  [[ "$lan_br" == "$wan_br" ]] && die "LAN і WAN не можуть бути одним bridge."
+
+  # --- VMID (дефолт 400) ---
+  local vmid=400
+  if qm status "$vmid" >/dev/null 2>&1; then
+    vmid="$(pvesh get /cluster/nextid 2>/dev/null || echo 401)"
+    warn "VMID 400 зайнятий → ${vmid}."
+  fi
+  read -rp "VMID [${vmid}]: " v || true; vmid="${v:-$vmid}"
+  qm status "$vmid" >/dev/null 2>&1 && die "VM ${vmid} вже існує."
+
+  # ресурси (рекомендовані для OPNsense)
+  local cores=2 mem=2048 disk=20
+  echo
+  info "Параметри OPNsense VM:"
+  echo "    VMID=${vmid} name=opnsense"
+  echo "    machine=q35 cpu=host cores=${cores} memory=${mem}MB disk=${disk}G@${diskstore}"
+  echo "    net0(WAN)=virtio@${wan_br}  net1(LAN)=virtio@${lan_br}"
+  echo "    ISO=${iso_ref}  ostype=other(FreeBSD)  onboot=ТАК (роутер)"
+  confirm "Створити VM?" || { warn "Скасовано."; return 0; }
+
+  qm create "$vmid" \
+    --name opnsense \
+    --machine q35 \
+    --cpu host \
+    --cores "$cores" --sockets 1 \
+    --memory "$mem" \
+    --ostype other \
+    --scsihw virtio-scsi-single \
+    --scsi0 "${diskstore}:${disk}" \
+    --net0 "virtio,bridge=${wan_br}" \
+    --net1 "virtio,bridge=${lan_br}" \
+    --ide2 "${iso_ref},media=cdrom" \
+    --boot "order=scsi0;ide2" \
+    --onboot 1
+  ok "OPNsense VM ${vmid} створено. Autostart УВІМКНЕНО (роутер)."
+  echo
+  info "Далі:"
+  echo "    qm start ${vmid}   → консоль у web UI → інсталяція"
+  echo "    Признач інтерфейси: WAN=vtnet0 (${wan_br}), LAN=vtnet1 (${lan_br})"
+  echo "    LAN за замовчуванням 192.168.1.1, DHCP роздає OPNsense."
+  warn "⚠ vmbr з фізичним WAN-портом = OPNsense отримає реальний інтернет-канал."
+}
+
+# ============================================================
 #  MAIN
 # ============================================================
 GPU_NEEDS_REBOOT=0
@@ -725,6 +832,7 @@ show_menu(){
   echo "  5) Кнопка живлення → reboot VM"
   echo "  6) Debian VM (актуальний ISO + створення)"
   echo "  7) Перевірка IOMMU-груп (чистота GPU)"
+  echo "  8) OPNsense VM (WAN + LAN)"
   echo "  q) Вихід"
   [[ "$GPU_NEEDS_REBOOT" == "1" ]] && echo "  ${YEL}* очікує REBOOT для застосування GPU passthrough${RST}"
   echo
@@ -757,6 +865,7 @@ main(){
       5) power_button_vm ;;
       6) debian_vm ;;
       7) iommu_check ;;
+      8) opnsense_vm ;;
       q|Q) finish ;;
       *) warn "Невірний вибір: '$ch'"; continue ;;
     esac

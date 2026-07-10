@@ -10,6 +10,7 @@
 5. **Кнопка живлення → reboot VM** — хост ігнорує power-key, acpid ловить подію → `qm reboot <VMID>`.
 6. **Debian VM** — знайти й завантажити актуальний netinst ISO, створити VM (q35, cpu host, 4 ядра, 8 GB ОЗУ, 10 GB диск, virtio, без autostart).
 7. **Перевірка IOMMU-груп** — чи GPU у чистій групі (без чужих пристроїв) для безпечного passthrough.
+8. **OPNsense VM** — завантажити актуальний dvd ISO з дзеркала, розпакувати, створити VM з двома NIC (net0=WAN, net1=LAN), q35/host/2c/2G/20G, autostart увімкнено.
 
 ## Запуск
 
