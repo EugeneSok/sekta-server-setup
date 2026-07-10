@@ -956,13 +956,13 @@ show_menu(){
   echo "${BLD}=== Інтерактивне налаштування сервера Sekta ===${RST}"
   echo "  1) Post-install (repo + nag + upgrade)"
   echo "  2) GPU passthrough (Intel iGPU пріоритет)"
-  echo "  3) USB storage (exFAT)"
-  echo "  4) LAN bridge для OPNsense"
-  echo "  5) Кнопка живлення → reboot VM"
-  echo "  6) Debian VM (актуальний ISO + створення)"
-  echo "  7) Перевірка IOMMU-груп (чистота GPU)"
-  echo "  8) OPNsense VM (WAN + LAN)"
-  echo "  9) LXC Pi-hole (DNS-фільтр)"
+  echo "  3) Перевірка IOMMU-груп (чистота GPU)"
+  echo "  4) USB storage (exFAT)"
+  echo "  5) LAN bridge для OPNsense"
+  echo "  6) OPNsense VM (WAN + LAN)"
+  echo "  7) LXC Pi-hole (DNS-фільтр)"
+  echo "  8) Debian VM (актуальний ISO + створення)"
+  echo "  9) Кнопка живлення → reboot VM"
   echo "  q) Вихід"
   [[ "$GPU_NEEDS_REBOOT" == "1" ]] && echo "  ${YEL}* очікує REBOOT для застосування GPU passthrough${RST}"
   echo
@@ -990,13 +990,13 @@ main(){
     case "$ch" in
       1) post_install ;;
       2) gpu_passthrough ;;
-      3) usb_storage ;;
-      4) network_bridge ;;
-      5) power_button_vm ;;
-      6) debian_vm ;;
-      7) iommu_check ;;
-      8) opnsense_vm ;;
-      9) pihole_lxc ;;
+      3) iommu_check ;;
+      4) usb_storage ;;
+      5) network_bridge ;;
+      6) opnsense_vm ;;
+      7) pihole_lxc ;;
+      8) debian_vm ;;
+      9) power_button_vm ;;
       q|Q) finish ;;
       *) warn "Невірний вибір: '$ch'"; continue ;;
     esac
