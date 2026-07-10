@@ -29,8 +29,8 @@ confirm(){
 
 need_root(){ [[ $EUID -eq 0 ]] || die "Запусти під root."; }
 
-# джерело kiosk-інсталятора (окремий репо debian-kiosk-splash)
-KIOSK_RAW="https://raw.githubusercontent.com/EugeneSok/debian-kiosk-splash/main"
+# джерело kiosk-інсталятора (тека kiosk/ у цьому ж репо)
+KIOSK_RAW="https://raw.githubusercontent.com/EugeneSok/sekta-server-setup/main/kiosk"
 KIOSK_DEFAULT_URL="https://combat.omega"
 
 check_pve(){
@@ -953,7 +953,7 @@ EOF"
 # ============================================================
 #  МОДУЛЬ 10: Kiosk-дисплей (Plymouth splash + Chromium kiosk)
 #  Ставиться на ОКРЕМУ машину-дисплей (Debian/RPi), НЕ на PVE-хост.
-#  Тягне інсталятор debian-kiosk-splash і запускає його від звичайного
+#  Тягне інсталятор з kiosk/ цього ж репо і запускає його від звичайного
 #  користувача (інсталятор відмовляється працювати під root).
 # ============================================================
 kiosk_display(){
@@ -1002,7 +1002,7 @@ kiosk_display(){
   rm -f "$tmp"
   echo
   ok "Kiosk-модуль завершено."
-  info "Джерело: github.com/EugeneSok/debian-kiosk-splash"
+  info "Джерело: kiosk/ у цьому репо (sekta-server-setup)"
 }
 
 # ============================================================

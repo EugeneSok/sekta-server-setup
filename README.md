@@ -12,7 +12,7 @@
 7. **LXC Pi-hole** — шаблон Debian 12, unprivileged контейнер (1c/512M/8G) на LAN-bridge, static або DHCP, unattended-інсталяція Pi-hole, опційний пароль web-адмінки.
 8. **Debian VM** — знайти й завантажити актуальний netinst ISO, створити VM (q35, cpu host, 4 ядра, 8 GB ОЗУ, 10 GB диск, virtio, без autostart).
 9. **Кнопка живлення → reboot VM** — хост ігнорує power-key, acpid ловить подію → `qm reboot <VMID>`.
-10. **Kiosk-дисплей** — Plymouth boot-splash з логотипом SEKTA + Chromium у режимі kiosk (systemd `--user` unit) на **окремій машині-дисплеї** (Debian / Raspberry Pi OS). Запускає інсталятор [`debian-kiosk-splash`](https://github.com/EugeneSok/debian-kiosk-splash) від звичайного користувача.
+10. **Kiosk-дисплей** — Plymouth boot-splash з логотипом SEKTA + Chromium у режимі kiosk (systemd `--user` unit) на **окремій машині-дисплеї** (Debian / Raspberry Pi OS). Інсталятор — у теці [`kiosk/`](kiosk/) цього ж репо; запускається від звичайного користувача.
 
 ## Мінімальні вимоги заліза
 
