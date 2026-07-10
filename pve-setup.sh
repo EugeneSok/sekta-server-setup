@@ -481,6 +481,217 @@ EOF
 }
 
 # ============================================================
+#  МОДУЛЬ 5: Post-install (repo + nag + upgrade)
+# ============================================================
+post_install(){
+  echo
+  echo "${BLD}=== Post-install ===${RST}"
+
+  # codename Debian під версію PVE (bookworm=PVE8, trixie=PVE9)
+  local codename
+  codename="$(. /etc/os-release; echo "${VERSION_CODENAME:-bookworm}")"
+  info "Debian codename: ${codename}"
+
+  # --- 1. вимкнути enterprise repo (формати .list і deb822 .sources) ---
+  local changed=0
+  for f in /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/ceph.list; do
+    if [[ -f "$f" ]] && grep -qE '^\s*deb ' "$f"; then
+      cp -a "$f" "${f}.bak.$(date +%s)"
+      sed -i 's|^\s*deb |# deb |' "$f"
+      ok "Вимкнено enterprise repo: $f"; changed=1
+    fi
+  done
+  for f in /etc/apt/sources.list.d/pve-enterprise.sources /etc/apt/sources.list.d/ceph.sources; do
+    if [[ -f "$f" ]] && ! grep -qiE '^\s*Enabled:\s*false' "$f"; then
+      cp -a "$f" "${f}.bak.$(date +%s)"
+      if grep -qiE '^\s*Enabled:' "$f"; then
+        sed -i 's|^\s*Enabled:.*|Enabled: false|I' "$f"
+      else
+        echo "Enabled: false" >> "$f"
+      fi
+      ok "Вимкнено enterprise repo (deb822): $f"; changed=1
+    fi
+  done
+
+  # --- 2. додати no-subscription repo ---
+  local nosub=/etc/apt/sources.list.d/pve-no-subscription.list
+  if [[ ! -f "$nosub" ]] || ! grep -q 'pve-no-subscription' "$nosub"; then
+    echo "deb http://download.proxmox.com/debian/pve ${codename} pve-no-subscription" > "$nosub"
+    ok "Додано no-subscription repo → $nosub"; changed=1
+  else
+    ok "no-subscription repo вже є."
+  fi
+
+  # --- 3. прибрати 'No valid subscription' nag ---
+  local nagjs=/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+  if [[ -f "$nagjs" ]] && grep -q 'data.status.toLowerCase() !== .active' "$nagjs"; then
+    cp -a "$nagjs" "${nagjs}.bak.$(date +%s)"
+    # відомий робочий патч: підмінити перевірку 'active' на 'nokey'
+    sed -i "s/.data.status.toLowerCase() !== 'active'/.data.status.toLowerCase() == 'nokey'/g" "$nagjs"
+    systemctl restart pveproxy 2>/dev/null || true
+    ok "Nag прибрано (реверт при оновленні пакету proxmox-widget-toolkit)."
+  else
+    info "Nag-патерн не знайдено (вже прибрано або інша версія) — пропуск."
+  fi
+
+  # --- 4. update + dist-upgrade ---
+  info "apt update…"
+  apt-get update
+  echo
+  if confirm "Виконати dist-upgrade зараз? (може тягнути новий kernel)"; then
+    DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y
+    ok "dist-upgrade завершено."
+    warn "Якщо оновився kernel — потрібен reboot."
+  else
+    warn "dist-upgrade пропущено. Пізніше: apt update && apt dist-upgrade"
+  fi
+  ok "Post-install готовий."
+}
+
+# ============================================================
+#  МОДУЛЬ 6: Debian VM (актуальний ISO + створення VM)
+# ============================================================
+debian_vm(){
+  echo
+  echo "${BLD}=== Debian VM (q35, host, 4c/8G/10G, без autostart) ===${RST}"
+  command -v qm >/dev/null 2>&1 || die "qm не знайдено — не хост Proxmox."
+
+  # --- знайти актуальний netinst ISO ---
+  local base="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/"
+  info "Шукаю актуальний Debian netinst ISO…"
+  local iso
+  iso="$(curl -fsSL "$base" | grep -oE 'debian-[0-9.]+-amd64-netinst\.iso' | sort -Vu | tail -n1 || true)"
+  [[ -n "$iso" ]] || die "Не знайшов ISO на ${base} — перевір інтернет."
+  info "Актуальний ISO: ${BLD}${iso}${RST}"
+
+  # --- ISO storage (dir з content=iso) ---
+  local isodir=/var/lib/vz/template/iso
+  mkdir -p "$isodir"
+  local isopath="${isodir}/${iso}"
+  if [[ -f "$isopath" ]]; then
+    ok "ISO вже завантажено: $isopath"
+  else
+    confirm "Завантажити ${iso} у ${isodir}?" || { warn "Скасовано."; return 0; }
+    info "Завантаження…"
+    curl -fL --progress-bar -o "${isopath}.part" "${base}${iso}"
+    mv "${isopath}.part" "$isopath"
+    ok "Завантажено: $isopath"
+  fi
+  local iso_ref="local:iso/${iso}"
+
+  # --- storage для диска (content=images) ---
+  local diskstore
+  diskstore="$(pvesm status -content images 2>/dev/null | awk 'NR>1{print $1}' | grep -x local-lvm || \
+               pvesm status -content images 2>/dev/null | awk 'NR>1{print $1; exit}')"
+  [[ -n "$diskstore" ]] || die "Немає storage з content=images."
+  read -rp "Storage для диска [${diskstore}]: " s || true; diskstore="${s:-$diskstore}"
+
+  # --- bridge ---
+  local br=vmbr0
+  ip link show vmbr0 >/dev/null 2>&1 || br="$(ip -br link show type bridge | awk 'NR==1{print $1}')"
+  read -rp "Bridge для мережі [${br}]: " b || true; br="${b:-$br}"
+
+  # --- VMID ---
+  local vmid; vmid="$(pvesh get /cluster/nextid 2>/dev/null || echo 100)"
+  read -rp "VMID [${vmid}]: " v || true; vmid="${v:-$vmid}"
+  qm status "$vmid" >/dev/null 2>&1 && die "VM ${vmid} вже існує."
+
+  local name=debian
+  read -rp "Ім'я VM [${name}]: " n || true; name="${n:-$name}"
+
+  echo
+  info "Параметри VM:"
+  echo "    VMID=${vmid} name=${name}"
+  echo "    machine=q35 cpu=host cores=4 sockets=1 memory=8192MB"
+  echo "    disk=10G на ${diskstore}  net=virtio@${br}"
+  echo "    ISO=${iso_ref}  onboot=НІ  ostype=l26"
+  confirm "Створити VM?" || { warn "Скасовано."; return 0; }
+
+  qm create "$vmid" \
+    --name "$name" \
+    --machine q35 \
+    --cpu host \
+    --cores 4 --sockets 1 \
+    --memory 8192 \
+    --ostype l26 \
+    --scsihw virtio-scsi-single \
+    --scsi0 "${diskstore}:10" \
+    --net0 "virtio,bridge=${br}" \
+    --ide2 "${iso_ref},media=cdrom" \
+    --boot "order=scsi0;ide2" \
+    --onboot 0 \
+    --agent enabled=1
+  ok "VM ${vmid} (${name}) створено. Autostart вимкнено."
+  info "Старт вручну: qm start ${vmid}  (консоль у web UI → VM ${vmid} → Console)"
+}
+
+# ============================================================
+#  МОДУЛЬ 7: перевірка IOMMU-груп (чи GPU ізольована чисто)
+# ============================================================
+iommu_check(){
+  echo
+  echo "${BLD}=== Перевірка IOMMU-груп ===${RST}"
+  if [[ ! -d /sys/kernel/iommu_groups ]] || [[ -z "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]]; then
+    err "IOMMU не активний (немає /sys/kernel/iommu_groups)."
+    warn "Спочатку модуль 1 (GPU passthrough) + REBOOT, тоді перевіряй."
+    return 0
+  fi
+  ok "IOMMU активний."
+
+  # знайти GPU
+  echo
+  echo "GPU у системі:"
+  local -a gaddr=()
+  while read -r line; do
+    local a; a="$(awk '{print $1}' <<<"$line")"
+    gaddr+=("$a")
+    printf "  %s  %s\n" "$a" "$(sed -E 's/^[^ ]+ //' <<<"$line")"
+  done < <(lspci -Dnn | grep -iE 'VGA compatible controller|3D controller|Display controller')
+  [[ ${#gaddr[@]} -gt 0 ]] || { warn "GPU не знайдено."; return 0; }
+
+  # для кожної GPU показати групу і чистоту
+  local addr
+  for addr in "${gaddr[@]}"; do
+    # знайти номер групи
+    local grp="" gp
+    for gp in /sys/kernel/iommu_groups/*/devices/"$addr"; do
+      [[ -e "$gp" ]] || continue
+      grp="$(basename "$(dirname "$(dirname "$gp")")")"
+      break
+    done
+    [[ -z "$grp" ]] && { warn "${addr}: групу не знайдено"; continue; }
+
+    echo
+    echo "${BLD}GPU ${addr} → IOMMU group ${grp}${RST}"
+    local -a members=()
+    local d name drv extra=0
+    for d in /sys/kernel/iommu_groups/"$grp"/devices/*; do
+      local pci; pci="$(basename "$d")"
+      name="$(lspci -Dnns "$pci" | sed -E 's/^[^ ]+ //')"
+      drv="$(lspci -Dks "$pci" | awk -F': ' '/Kernel driver in use/{print $2}')"
+      members+=("$pci")
+      # "свій" = той самий слот що GPU (GPU + її audio) або bridge
+      local slot="${addr%.*}"
+      local is_own="no"
+      [[ "$pci" == "$slot".* ]] && is_own="yes"
+      if grep -qiE 'PCI bridge|Host bridge' <<<"$name"; then is_own="bridge"; fi
+      local mark="${GRN}✓${RST}"
+      [[ "$is_own" == "no" ]] && { mark="${RED}✗ ЧУЖИЙ${RST}"; extra=1; }
+      printf "    %s %s  [drv: %s]  %s\n" "$mark" "$pci" "${drv:-—}" "$name"
+    done
+
+    if [[ "$extra" == "0" ]]; then
+      ok "Група ${grp} ЧИСТА — тільки GPU + її функції/bridge. Passthrough безпечний."
+    else
+      err "Група ${grp} МІШАНА — містить чужі пристрої (позначені ✗)."
+      warn "Passthrough віддасть ЇХ РАЗОМ з GPU. Варіанти:"
+      echo "      • інший PCIe слот для карти"
+      echo "      • ACS override (ризиковано): pcie_acs_override=downstream,multifunction у cmdline"
+    fi
+  done
+}
+
+# ============================================================
 #  MAIN
 # ============================================================
 GPU_NEEDS_REBOOT=0
@@ -492,6 +703,9 @@ show_menu(){
   echo "  2) USB storage (exFAT)"
   echo "  3) Мережевий bridge"
   echo "  4) Кнопка живлення → reboot VM"
+  echo "  5) Post-install (repo + nag + upgrade)"
+  echo "  6) Debian VM (актуальний ISO + створення)"
+  echo "  7) Перевірка IOMMU-груп (чистота GPU)"
   echo "  q) Вихід"
   [[ "$GPU_NEEDS_REBOOT" == "1" ]] && echo "  ${YEL}* очікує REBOOT для застосування GPU passthrough${RST}"
   echo
@@ -521,6 +735,9 @@ main(){
       2) usb_storage ;;
       3) network_bridge ;;
       4) power_button_vm ;;
+      5) post_install ;;
+      6) debian_vm ;;
+      7) iommu_check ;;
       q|Q) finish ;;
       *) warn "Невірний вибір: '$ch'"; continue ;;
     esac
