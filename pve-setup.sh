@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # ----- кольори / лог -----
-RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; BLU=$'\e[34m'; BLD=$'\e[1m'; RST=$'\e[0m'
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; BLU=$'\e[34m'; BLD=$'\e[1m'; DIM=$'\e[2m'; RST=$'\e[0m'
 info(){ echo "${BLU}[i]${RST} $*"; }
 ok(){   echo "${GRN}[ok]${RST} $*"; }
 warn(){ echo "${YEL}[!]${RST} $*"; }
@@ -211,12 +211,39 @@ gpu_passthrough(){
   warn "Потрібен ${BLD}REBOOT${RST}. Після ребуту перевір:"
   echo "    dmesg | grep -e DMAR -e IOMMU"
   echo "    lspci -Dks ${addr}   # 'Kernel driver in use: vfio-pci'"
-  GPU_NEEDS_REBOOT=1
+  touch "$GPU_REBOOT_FLAG"
 }
 
 # ============================================================
 #  МОДУЛЬ 2: USB storage (exFAT)
 # ============================================================
+# Усі фізичні диски, що несуть кореневу ФС. Покриває три розкладки
+# кореня на PVE: bare-partition (/dev/sdX3), LVM (/dev/mapper/pve-root),
+# ZFS (rpool/ROOT/…). Друкує по одному цілому диску (/dev/sdX) на рядок.
+_system_disks(){
+  local src; src="$(findmnt -no SOURCE / 2>/dev/null || true)"
+  [[ -n "$src" ]] || return 0
+  local -A seen=()
+  # ZFS: джерело = ім'я пулу (не /dev/…) — диски беремо з zpool
+  if [[ "$src" != /dev/* ]] && command -v zpool >/dev/null 2>&1; then
+    local pool="${src%%/*}" d disk
+    while read -r d; do
+      [[ -b "$d" ]] || continue
+      disk="/dev/$(lsblk -no pkname "$d" 2>/dev/null | head -n1)"
+      [[ "$disk" == "/dev/" ]] && disk="$d"
+      seen["$disk"]=1
+    done < <(zpool list -vHPL "$pool" 2>/dev/null | awk '/\/dev\//{print $1}')
+  fi
+  # block-device джерело (partition або LVM mapper): піднімаємось до диску
+  if [[ -b "$src" || "$src" == /dev/mapper/* ]]; then
+    local n t
+    while read -r n t; do
+      [[ "$t" == "disk" ]] && seen["/dev/$n"]=1
+    done < <(lsblk -nso NAME,TYPE "$src" 2>/dev/null)
+  fi
+  [[ ${#seen[@]} -gt 0 ]] && printf '%s\n' "${!seen[@]}"
+}
+
 usb_storage(){
   echo
   echo "${BLD}=== USB storage (exFAT) ===${RST}"
@@ -238,9 +265,18 @@ usb_storage(){
   read -rp "Вкажи пристрій флешки (напр. /dev/sda): " dev || true
   [[ -b "$dev" ]] || { err "Немає block-device: $dev"; warn "Повертаюсь у меню."; return 0; }
 
-  # захист: не системний диск
-  local rootsrc; rootsrc="$(findmnt -no SOURCE / || true)"
-  if [[ "$rootsrc" == "$dev"* ]]; then
+  # захист: не системний диск. Нормалізуємо обраний пристрій до цілого
+  # диску (partition → її диск) і звіряємо зі списком дисків кореня.
+  local devdisk; devdisk="/dev/$(lsblk -no pkname "$dev" 2>/dev/null | head -n1)"
+  [[ "$devdisk" == "/dev/" ]] && devdisk="$dev"   # обрали вже цілий диск
+  local sysdisks; sysdisks="$(_system_disks)"
+  if [[ -n "$sysdisks" ]] && grep -qxF "$devdisk" <<<"$sysdisks"; then
+    err "$dev несе кореневу ФС (системний диск). Відмова."
+    warn "Повертаюсь у меню."; return 0
+  fi
+  # запасний рубіж, якщо диски кореня не визначились (напр. рідкісний setup):
+  local rootsrc; rootsrc="$(findmnt -no SOURCE / 2>/dev/null || true)"
+  if [[ -z "$sysdisks" && -n "$rootsrc" && "$rootsrc" == "$dev"* ]]; then
     err "$dev виглядає як системний диск (корінь на ньому). Відмова."
     warn "Повертаюсь у меню."; return 0
   fi
@@ -585,7 +621,7 @@ post_install(){
 # ============================================================
 debian_vm(){
   echo
-  echo "${BLD}=== Debian VM (q35, host, 4c/8G/10G, без autostart) ===${RST}"
+  echo "${BLD}=== Debian VM (q35/UEFI, host, 4c/8G/10G, без autostart) ===${RST}"
   command -v qm >/dev/null 2>&1 || die "qm не знайдено — не хост Proxmox."
 
   # --- знайти актуальний netinst ISO ---
@@ -639,14 +675,16 @@ debian_vm(){
   echo
   info "Параметри VM:"
   echo "    VMID=${vmid} name=${name}"
-  echo "    machine=q35 cpu=host cores=4 sockets=1 memory=8192MB"
-  echo "    disk=10G на ${diskstore}  net=virtio@${br}"
+  echo "    machine=q35 bios=ovmf(UEFI) cpu=host cores=4 sockets=1 memory=8192MB"
+  echo "    disk=10G на ${diskstore}  efidisk на ${diskstore}  net=virtio@${br}"
   echo "    ISO=${iso_ref}  onboot=НІ  ostype=l26"
   confirm "Створити VM?" || { warn "Скасовано."; return 0; }
 
   qm create "$vmid" \
     --name "$name" \
     --machine q35 \
+    --bios ovmf \
+    --efidisk0 "${diskstore}:0,efitype=4m,pre-enrolled-keys=0" \
     --cpu host \
     --cores 4 --sockets 1 \
     --memory 8192 \
@@ -1023,7 +1061,10 @@ kiosk_display(){
 # ============================================================
 #  MAIN
 # ============================================================
-GPU_NEEDS_REBOOT=0
+# Модулі запускаються у субшелі (див. case у main), тому «reboot потрібен»
+# прапорець тримаємо у файлі, а не у змінній — інакше не переживе субшел.
+GPU_REBOOT_FLAG="/run/pve-setup.gpu-reboot"
+rm -f "$GPU_REBOOT_FLAG"
 
 show_menu(){
   echo
@@ -1033,13 +1074,14 @@ show_menu(){
   echo "  3) Перевірка IOMMU-груп (чистота GPU)"
   echo "  4) USB storage (exFAT)"
   echo "  5) LAN bridge для OPNsense"
-  echo "  6) OPNsense VM (WAN + LAN)"
-  echo "  7) LXC Pi-hole (DNS-фільтр)"
-  echo "  8) Debian VM (актуальний ISO + створення)"
-  echo "  9) Кнопка живлення → reboot VM"
-  echo "  10) Kiosk-дисплей (Chromium + boot splash) — на машині-дисплеї"
+  echo "  6) Debian VM (актуальний ISO + створення)"
+  echo "  7) Кнопка живлення → reboot VM"
+  echo "  8) Kiosk-дисплей (Chromium + boot splash) — на машині-дисплеї"
+  echo "  ${DIM}— опційні мережеві сервіси —${RST}"
+  echo "  9) OPNsense VM (WAN + LAN) ${DIM}[опційно]${RST}"
+  echo "  10) LXC Pi-hole (DNS-фільтр) ${DIM}[опційно]${RST}"
   echo "  q) Вихід"
-  [[ "$GPU_NEEDS_REBOOT" == "1" ]] && echo "  ${YEL}* очікує REBOOT для застосування GPU passthrough${RST}"
+  [[ -e "$GPU_REBOOT_FLAG" ]] && echo "  ${YEL}* очікує REBOOT для застосування GPU passthrough${RST}"
   echo
 }
 
@@ -1050,7 +1092,7 @@ main(){
   # безпечний вихід: якщо GPU налаштовано — нагадати про reboot
   finish(){
     echo
-    if [[ "$GPU_NEEDS_REBOOT" == "1" ]]; then
+    if [[ -e "$GPU_REBOOT_FLAG" ]]; then
       warn "GPU passthrough вимагає перезавантаження."
       if confirm "Перезавантажити зараз?"; then reboot; fi
     fi
@@ -1062,22 +1104,30 @@ main(){
     show_menu
     local ch
     read -rp "Вибір: " ch || { finish; }
+    # Кожен модуль — у субшелі: `die`/`exit` всередині завершує ЛИШЕ модуль,
+    # меню виживає. Зміни на диску лишаються; змінних оболонки модулі не
+    # експортують (єдиний прапорець GPU_REBOOT_FLAG — у файлі).
     case "$ch" in
-      1) post_install ;;
-      2) gpu_passthrough ;;
-      3) iommu_check ;;
-      4) usb_storage ;;
-      5) network_bridge ;;
-      6) opnsense_vm ;;
-      7) pihole_lxc ;;
-      8) debian_vm ;;
-      9) power_button_vm ;;
-      10) kiosk_display ;;
+      1) ( post_install ) ;;
+      2) ( gpu_passthrough ) ;;
+      3) ( iommu_check ) ;;
+      4) ( usb_storage ) ;;
+      5) ( network_bridge ) ;;
+      6) ( debian_vm ) ;;
+      7) ( power_button_vm ) ;;
+      8) ( kiosk_display ) ;;
+      9) ( opnsense_vm ) ;;
+      10) ( pihole_lxc ) ;;
       q|Q) finish ;;
       *) warn "Невірний вибір: '$ch'"; continue ;;
     esac
+    local rc=$?
     echo
-    ok "Модуль завершено. Повертаюсь у меню…"
+    if [[ $rc -eq 0 ]]; then
+      ok "Модуль завершено. Повертаюсь у меню…"
+    else
+      warn "Модуль перервано (код ${rc}). Повертаюсь у меню…"
+    fi
     read -rp "Натисни Enter…" _ || true
   done
 }
