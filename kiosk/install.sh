@@ -232,12 +232,27 @@ RestartSec=2
 WantedBy=graphical-session.target
 EOF
 
-info "Enabling kiosk service..."
-systemctl --user daemon-reload
-systemctl --user enable --now "$SERVICE" || \
-  warn "Could not start now (no active graphical session?). It will start on next login."
-
-info "Enabling user lingering (start without opening a terminal)..."
+# `systemctl --user` needs a running user manager + session bus. When this
+# runs via `sudo -u` or a non-login shell (e.g. from pve-setup) there is none,
+# giving "Failed to connect to user scope bus". Enable lingering FIRST so the
+# user manager starts, point env at its bus, then wait for the socket.
+info "Enabling user lingering (starts the user manager without a login)..."
 sudo loginctl enable-linger "$USER"
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+for _ in $(seq 1 20); do
+  [ -S "$XDG_RUNTIME_DIR/bus" ] && break
+  sleep 0.5
+done
+
+info "Enabling kiosk service..."
+if systemctl --user daemon-reload 2>/dev/null && \
+   systemctl --user enable --now "$SERVICE" 2>/dev/null; then
+  :
+else
+  warn "No user session bus yet — service enabled to start on next login/boot."
+  systemctl --user enable "$SERVICE" 2>/dev/null || true
+fi
 
 info "Done. Reboot to see the splash and kiosk:  sudo reboot"

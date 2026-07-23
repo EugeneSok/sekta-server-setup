@@ -996,7 +996,7 @@ kiosk_display(){
   curl -fsSL "${KIOSK_RAW}/install.sh" -o "$tmp" || { rm -f "$tmp"; die "Не завантажив install.sh."; }
   chmod 0644 "$tmp"   # mktemp дає 600/root → цільовий користувач не прочитає
   if [[ -n "$runas" ]]; then
-    sudo -u "$runas" KIOSK_URL="$url" bash "$tmp"
+    sudo -u "$runas" -H KIOSK_URL="$url" bash "$tmp"
   else
     KIOSK_URL="$url" bash "$tmp"
   fi
