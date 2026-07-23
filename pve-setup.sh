@@ -114,7 +114,12 @@ gpu_passthrough(){
   mapfile -t gpu_lines < <(
     lspci -Dnn | grep -iE 'VGA compatible controller|3D controller|Display controller' || true
   )
-  [[ ${#gpu_lines[@]} -gt 0 ]] || die "GPU не знайдено (lspci)."
+  if [[ ${#gpu_lines[@]} -eq 0 ]]; then
+    err "GPU не знайдено через lspci."
+    command -v lspci >/dev/null 2>&1 || warn "lspci відсутній → apt install pciutils"
+    warn "Повертаюсь у меню."
+    return 0
+  fi
 
   local -a G_ADDR G_IDS G_DESC G_IGPU
   local i=0 default_idx=-1
@@ -144,7 +149,7 @@ gpu_passthrough(){
   local sel
   read -rp "Який GPU ізолювати для passthrough? [${default_idx}] " sel || true
   sel="${sel:-$default_idx}"
-  [[ "$sel" =~ ^[0-9]+$ && $sel -lt $i ]] || die "Невірний вибір."
+  [[ "$sel" =~ ^[0-9]+$ && $sel -lt $i ]] || { err "Невірний вибір."; warn "Повертаюсь у меню."; return 0; }
 
   local addr="${G_ADDR[$sel]}" ids="${G_IDS[$sel]}" desc="${G_DESC[$sel]}"
   echo
@@ -231,12 +236,13 @@ usb_storage(){
   info "USB-диски зазвичай мають TRAN=usb."
   local dev
   read -rp "Вкажи пристрій флешки (напр. /dev/sda): " dev || true
-  [[ -b "$dev" ]] || die "Немає block-device: $dev"
+  [[ -b "$dev" ]] || { err "Немає block-device: $dev"; warn "Повертаюсь у меню."; return 0; }
 
   # захист: не системний диск
   local rootsrc; rootsrc="$(findmnt -no SOURCE / || true)"
   if [[ "$rootsrc" == "$dev"* ]]; then
-    die "$dev виглядає як системний диск (корінь на ньому). Відмова."
+    err "$dev виглядає як системний диск (корінь на ньому). Відмова."
+    warn "Повертаюсь у меню."; return 0
   fi
 
   echo
@@ -257,9 +263,9 @@ usb_storage(){
   else
     warn "FS не exFAT (${fstype:-порожньо})."
     warn "${RED}${BLD}ФОРМАТУВАННЯ ЗІТРЕ ВСІ ДАНІ на ${dev}!${RST}"
-    confirm "Форматувати ${dev} у exFAT?" || die "Скасовано користувачем."
+    confirm "Форматувати ${dev} у exFAT?" || { warn "Скасовано."; return 0; }
     read -rp "Введи ${BLD}FORMAT${RST} для підтвердження: " c || true
-    [[ "$c" == "FORMAT" ]] || die "Не підтверджено."
+    [[ "$c" == "FORMAT" ]] || { warn "Не підтверджено."; return 0; }
 
     # розмонтувати все з цього диску
     umount "${dev}"* 2>/dev/null || true
@@ -268,17 +274,25 @@ usb_storage(){
     command -v sgdisk >/dev/null 2>&1 || apt-get install -y gdisk
     sgdisk --zap-all "$dev"
     sgdisk -n1:0:0 -t1:0700 "$dev"     # 0700 = Microsoft basic data
-    partprobe "$dev"; sleep 2
+    partprobe "$dev"; udevadm settle 2>/dev/null || true; sleep 2
     part="$(lsblk -pnro NAME,TYPE "$dev" | awk '$2=="part"{print $1; exit}')"
-    [[ -n "$part" ]] || die "Не знайшов новий розділ."
+    [[ -n "$part" ]] || { err "Не знайшов новий розділ."; warn "Повертаюсь у меню."; return 0; }
     info "mkfs.exfat на ${part}…"
     mkfs.exfat -L PVEUSB "$part"
+    sync
     ok "Відформатовано у exFAT: ${part}"
   fi
 
-  # UUID + fstab + mount
-  local uuid; uuid="$(blkid -o value -s UUID "$part")"
-  [[ -n "$uuid" ]] || die "Не отримав UUID."
+  # UUID + fstab + mount. Після mkfs udev/blkid-кеш ще не бачить UUID —
+  # settle + кілька спроб, інакше blkid повертає порожньо і модуль падав.
+  local uuid=""
+  udevadm settle 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    uuid="$(blkid -o value -s UUID "$part" 2>/dev/null || true)"
+    [[ -n "$uuid" ]] && break
+    partprobe "$dev" 2>/dev/null || true; sleep 1
+  done
+  [[ -n "$uuid" ]] || { err "Не отримав UUID для ${part}."; warn "Повертаюсь у меню."; return 0; }
   local mnt=/mnt/usb
   mkdir -p "$mnt"
 
@@ -292,7 +306,7 @@ usb_storage(){
   fi
 
   info "Перевірка: mount -a…"
-  mount -a
+  mount -a || warn "mount -a повернув помилку — перевір /etc/fstab."
   if mountpoint -q "$mnt"; then ok "Змонтовано на ${mnt}"; else warn "Не змонтувалось — перевір вручну."; fi
   ls -lh "$mnt" || true
 
