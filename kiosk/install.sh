@@ -260,4 +260,109 @@ else
   systemctl --user enable "$SERVICE" 2>/dev/null || true
 fi
 
+# ============================================================================
+# PART 3 — system tweaks: UA keyboard, no screen sleep, autologin
+# ============================================================================
+
+# --- 3a. Ukrainian keyboard layout (us default + ua, Alt+Shift toggle) -------
+info "Keyboard: ensuring Ukrainian layout (us,ua — switch Alt+Shift)..."
+if [ -f /etc/default/keyboard ] && grep -qE 'XKBLAYOUT="[^"]*\bua\b' /etc/default/keyboard; then
+  info "Ukrainian layout already configured."
+else
+  sudo apt-get install -y keyboard-configuration console-setup >/dev/null 2>&1 || \
+    warn "Could not install keyboard-configuration/console-setup."
+  [ -f /etc/default/keyboard ] && \
+    sudo cp -a /etc/default/keyboard "/etc/default/keyboard.bak.$(date +%s)"
+  if command -v localectl >/dev/null 2>&1; then
+    # localectl writes /etc/default/keyboard for X and console in one shot
+    sudo localectl set-x11-keymap us,ua pc105 "" grp:alt_shift_toggle 2>/dev/null || \
+      warn "localectl keymap set failed."
+  else
+    sudo tee /etc/default/keyboard >/dev/null <<'EOF'
+XKBMODEL="pc105"
+XKBLAYOUT="us,ua"
+XKBVARIANT=","
+XKBOPTIONS="grp:alt_shift_toggle"
+BACKSPACE="guess"
+EOF
+  fi
+  sudo dpkg-reconfigure -f noninteractive keyboard-configuration >/dev/null 2>&1 || true
+  sudo setupcon --save 2>/dev/null || true
+  info "Ukrainian layout added (toggle: Alt+Shift)."
+fi
+
+# --- 3b. Disable screen sleep / suspend --------------------------------------
+# Display DPMS is already handled per-session by xset in the kiosk unit. Here we
+# stop the *machine* from suspending and stop the VT console from blanking.
+info "Screen sleep: checking system suspend/sleep state..."
+if systemctl is-enabled sleep.target suspend.target 2>/dev/null | grep -q masked; then
+  info "Sleep/suspend already masked."
+else
+  sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target \
+    >/dev/null 2>&1 || warn "Could not mask sleep targets."
+  info "System suspend/sleep disabled (masked)."
+fi
+# Kernel console blanking off (VT) via cmdline — GRUB only (no-op on RPi).
+if [ -f /etc/default/grub ] && ! grep -q 'consoleblank=0' /etc/default/grub; then
+  sudo cp -a /etc/default/grub "/etc/default/grub.bak.$(date +%s)"
+  sudo sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 consoleblank=0"/' /etc/default/grub
+  sudo update-grub
+  info "Console blanking disabled (consoleblank=0)."
+fi
+
+# --- 3c. Automatic login on Debian -------------------------------------------
+# Kiosk must land in a graphical session without a password. Config depends on
+# the display manager; we detect GDM3 / LightDM, else fall back to TTY autologin.
+info "Autologin: detecting display manager for user '$USER'..."
+autologin_done=""
+
+# GDM3 (GNOME)
+if [ -d /etc/gdm3 ] || systemctl list-unit-files 2>/dev/null | grep -q '^gdm'; then
+  GDM_CONF=/etc/gdm3/daemon.conf
+  sudo mkdir -p /etc/gdm3
+  [ -f "$GDM_CONF" ] && sudo cp -a "$GDM_CONF" "$GDM_CONF.bak.$(date +%s)"
+  [ -f "$GDM_CONF" ] || echo "[daemon]" | sudo tee "$GDM_CONF" >/dev/null
+  grep -q '^\[daemon\]' "$GDM_CONF" || echo "[daemon]" | sudo tee -a "$GDM_CONF" >/dev/null
+  # uncomment/replace existing keys if present
+  sudo sed -i \
+    -e "s/^[#[:space:]]*AutomaticLoginEnable[[:space:]]*=.*/AutomaticLoginEnable=true/" \
+    -e "s/^[#[:space:]]*AutomaticLogin[[:space:]]*=.*/AutomaticLogin=$USER/" \
+    "$GDM_CONF"
+  # insert under [daemon] if still missing
+  grep -q '^AutomaticLoginEnable=true' "$GDM_CONF" || \
+    sudo sed -i "/^\[daemon\]/a AutomaticLoginEnable=true" "$GDM_CONF"
+  grep -q "^AutomaticLogin=$USER" "$GDM_CONF" || \
+    sudo sed -i "/^AutomaticLoginEnable=true/a AutomaticLogin=$USER" "$GDM_CONF"
+  info "GDM3 autologin enabled for '$USER'."
+  autologin_done=1
+fi
+
+# LightDM
+if [ -z "$autologin_done" ] && { [ -d /etc/lightdm ] || systemctl list-unit-files 2>/dev/null | grep -q '^lightdm'; }; then
+  sudo mkdir -p /etc/lightdm/lightdm.conf.d
+  sudo tee /etc/lightdm/lightdm.conf.d/50-kiosk-autologin.conf >/dev/null <<EOF
+[Seat:*]
+autologin-user=$USER
+autologin-user-timeout=0
+EOF
+  # lightdm needs the user in the 'autologin' group on Debian
+  getent group autologin >/dev/null 2>&1 || sudo groupadd -r autologin 2>/dev/null || true
+  sudo gpasswd -a "$USER" autologin >/dev/null 2>&1 || true
+  info "LightDM autologin enabled for '$USER'."
+  autologin_done=1
+fi
+
+# No display manager → TTY1 autologin (graphical session still required, see PART 2)
+if [ -z "$autologin_done" ]; then
+  sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
+  sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin $USER --noclear %I \$TERM
+EOF
+  sudo systemctl daemon-reload 2>/dev/null || true
+  warn "No display manager found — set TTY1 autologin for '$USER'."
+  warn "A graphical session (startx / a display manager) is still needed for the kiosk."
+fi
+
 info "Done. Reboot to see the splash and kiosk:  sudo reboot"
