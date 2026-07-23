@@ -994,6 +994,7 @@ kiosk_display(){
   # завантажити інсталятор і виконати від цільового користувача
   local tmp; tmp="$(mktemp)"
   curl -fsSL "${KIOSK_RAW}/install.sh" -o "$tmp" || { rm -f "$tmp"; die "Не завантажив install.sh."; }
+  chmod 0644 "$tmp"   # mktemp дає 600/root → цільовий користувач не прочитає
   if [[ -n "$runas" ]]; then
     sudo -u "$runas" KIOSK_URL="$url" bash "$tmp"
   else
