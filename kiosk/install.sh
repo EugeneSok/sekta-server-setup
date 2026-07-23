@@ -32,6 +32,12 @@ die()   { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] && die "Run as a normal user, not root. The script uses sudo where needed."
 command -v sudo >/dev/null 2>&1 || die "sudo not found."
 
+# Every `systemctl --user` below needs a session bus. Under `sudo -u` or a
+# non-login shell (e.g. from pve-setup) it is undefined → "Failed to connect
+# to user scope bus". Point env at this user's runtime bus up front.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
 # --- Ask the user which address the kiosk should open ------------------------
 URL="${KIOSK_URL:-}"
 if [ -z "$URL" ]; then
@@ -239,8 +245,7 @@ EOF
 info "Enabling user lingering (starts the user manager without a login)..."
 sudo loginctl enable-linger "$USER"
 
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+# wait for the user manager to bring up its bus socket
 for _ in $(seq 1 20); do
   [ -S "$XDG_RUNTIME_DIR/bus" ] && break
   sleep 0.5
