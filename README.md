@@ -6,11 +6,11 @@
 1. **Post-install** — вимкнути enterprise repo, ввімкнути `no-subscription`, прибрати "No valid subscription" nag, `apt dist-upgrade`.
 2. **GPU passthrough** — детект GPU на хості, пріоритет Intel iGPU, IOMMU + vfio-pci + blacklist драйвера, звільнення framebuffer хоста для Intel. Автовизначення bootloader (GRUB / systemd-boot).
 3. **Перевірка IOMMU-груп** — чи GPU у чистій групі (без чужих пристроїв) для безпечного passthrough.
-4. **USB storage (exFAT)** — детект флешки, форматування в exFAT якщо інший FS, монтування по UUID з `nofail`, додавання Proxmox directory storage (`content=backup`).
+4. **USB storage (exFAT)** — детект флешки, відмова від системного диску (розпізнає корінь на partition / LVM / ZFS), форматування в exFAT якщо інший FS, монтування по UUID з `nofail`, додавання Proxmox directory storage (`content=backup`).
 5. **LAN bridge для OPNsense** — наявний uplink-інтерфейс = WAN, новий bridge на вільному NIC = LAN (без IP на хості — адресацію тримає OPNsense). Виводить мапу net0=WAN / net1=LAN для VM. Якщо вільного NIC нема — internal-only bridge для VM-мережі.
 6. **Debian VM** — знайти й завантажити актуальний netinst ISO, створити VM (q35/UEFI, cpu host, 4 ядра, 8 GB ОЗУ, 10 GB диск, virtio, без autostart).
 7. **Кнопка живлення → reboot VM** — хост ігнорує power-key, acpid ловить подію → `qm reboot <VMID>`.
-8. **Kiosk-дисплей** — Plymouth boot-splash з логотипом SEKTA + Chromium у режимі kiosk (systemd `--user` unit) на **окремій машині-дисплеї** (Debian / Raspberry Pi OS). Інсталятор — у теці [`kiosk/`](kiosk/) цього ж репо; запускається від звичайного користувача.
+8. **Kiosk-дисплей** — Plymouth boot-splash з логотипом SEKTA + Chromium у режимі kiosk (systemd `--user` unit) на **окремій машині-дисплеї** (Debian / Raspberry Pi OS). Додатково: українська розкладка клавіатури (`us,ua`, Alt+Shift), вимкнення засинання екрану/машини, автовхід у систему. Інсталятор — у теці [`kiosk/`](kiosk/) цього ж репо; запускається від звичайного користувача.
 9. **OPNsense VM** _(опційно)_ — завантажити актуальний dvd ISO з дзеркала, розпакувати, створити VM з двома NIC (net0=WAN, net1=LAN), q35/host/2c/2G/20G, autostart увімкнено.
 10. **LXC Pi-hole** _(опційно)_ — шаблон Debian 12, unprivileged контейнер (1c/512M/8G) на LAN-bridge, static або DHCP, unattended-інсталяція Pi-hole, опційний пароль web-адмінки.
 
@@ -63,7 +63,7 @@ chmod +x pve-setup.sh
 5. **LAN bridge** — підготувати WAN/LAN інтерфейси під роутер.
 6. **Debian VM** — робочі VM за потребою.
 7. **Кнопка живлення → reboot VM** — опційно, коли цільова VM вже існує.
-8. **Kiosk-дисплей** — окремо, **на самій машині-дисплеї** (не на PVE-хості): boot-splash + Chromium kiosk на дашборд.
+8. **Kiosk-дисплей** — окремо, **на самій машині-дисплеї** (не на PVE-хості): boot-splash + Chromium kiosk на дашборд + UA-клавіатура, без засинання, автовхід.
 
 Опційні (тільки якщо потрібен роутер/DNS-фільтр на цьому ж хості; передумова — пункт **5** LAN bridge):
 
