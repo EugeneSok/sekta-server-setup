@@ -140,7 +140,7 @@ gpu_passthrough(){
     G_ADDR[i]="$addr"; G_IDS[i]="$ids"; G_DESC[i]="$desc"; G_IGPU[i]="$igpu"
     local tag=""; [[ "$igpu" == "yes" ]] && { tag=" ${GRN}[iGPU]${RST}"; [[ $default_idx -lt 0 ]] && default_idx=$i; }
     printf "  ${BLD}%d${RST}) %s  ids=%s  driver=%s%s\n" "$i" "$desc" "$ids" "$drv" "$tag"
-    ((i++))
+    i=$((i+1))
   done
   [[ $default_idx -lt 0 ]] && default_idx=0   # немає iGPU → перший
 
@@ -417,7 +417,7 @@ network_bridge(){
   for ifc in "${free[@]}"; do
     local st; st="$(cat /sys/class/net/"$ifc"/operstate 2>/dev/null || echo '?')"
     printf "  ${BLD}%d${RST}) %s  (state=%s)\n" "$n" "$ifc" "$st"
-    ((n++))
+    n=$((n+1))
   done
   echo
   confirm "Створити LAN-bridge для OPNsense?" || { warn "Пропущено."; return 0; }
@@ -434,7 +434,7 @@ _make_lan_bridge(){
 
   # наступний вільний vmbrN
   local idx=0
-  while ip link show "vmbr${idx}" >/dev/null 2>&1; do ((idx++)); done
+  while ip link show "vmbr${idx}" >/dev/null 2>&1; do idx=$((idx+1)); done
   local br="vmbr${idx}"
   info "Створюю LAN-bridge ${BLD}${br}${RST}${port:+ з портом ${BLD}${port}${RST}}"
 
