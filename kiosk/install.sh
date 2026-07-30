@@ -15,6 +15,9 @@
 #
 # Non-interactive: preset the URL with the KIOSK_URL env var, e.g.
 #   curl -fsSL .../install.sh | KIOSK_URL=https://combat.omega bash
+# For a tabbed kiosk pass up to 3 space-separated URLs (opened as tabs, tab
+# strip stays visible so the operator can switch):
+#   curl -fsSL .../install.sh | KIOSK_URL="https://a.omega https://b.omega" bash
 #
 set -euo pipefail
 
@@ -38,16 +41,36 @@ command -v sudo >/dev/null 2>&1 || die "sudo not found."
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 
-# --- Ask the user which address the kiosk should open ------------------------
-URL="${KIOSK_URL:-}"
-if [ -z "$URL" ]; then
-  if [ -r /dev/tty ]; then
-    printf 'Address to open in kiosk [%s]: ' "$DEFAULT_URL" > /dev/tty
-    read -r URL < /dev/tty || true
-  fi
+# --- Ask the user which address(es) the kiosk should open --------------------
+# KIOSK_URL may hold one or more space-separated URLs. With a single URL the
+# kiosk runs locked in --kiosk mode. With >1 URL it opens them as browser tabs
+# in a maximised window so the operator can see and switch between them.
+URLS=()
+if [ -n "${KIOSK_URL:-}" ]; then
+  # split the env value on whitespace into the URL array
+  read -r -a URLS <<< "$KIOSK_URL"
 fi
-URL="${URL:-$DEFAULT_URL}"
-info "Kiosk URL: $URL"
+if [ "${#URLS[@]}" -eq 0 ] && [ -r /dev/tty ]; then
+  printf 'Address to open in kiosk [%s]: ' "$DEFAULT_URL" > /dev/tty
+  read -r first < /dev/tty || true
+  URLS+=("${first:-$DEFAULT_URL}")
+  # offer up to two more tabs
+  while [ "${#URLS[@]}" -lt 3 ]; do
+    printf 'Open another site in a tab? [y/N] ' > /dev/tty
+    read -r ans < /dev/tty || true
+    case "${ans,,}" in y|yes) ;; *) break ;; esac
+    printf 'URL for tab #%s: ' "$(( ${#URLS[@]} + 1 ))" > /dev/tty
+    read -r more < /dev/tty || true
+    [ -n "$more" ] && URLS+=("$more")
+  done
+fi
+[ "${#URLS[@]}" -eq 0 ] && URLS+=("$DEFAULT_URL")
+
+if [ "${#URLS[@]}" -gt 1 ]; then
+  info "Kiosk URLs (${#URLS[@]} tabs): ${URLS[*]}"
+else
+  info "Kiosk URL: ${URLS[0]}"
+fi
 
 # --- Remove any previous installation so this run is clean -------------------
 # Detect leftovers from an earlier run (Plymouth theme, kiosk unit) and wipe
@@ -215,6 +238,21 @@ sudo apt-get install -y x11-xserver-utils >/dev/null 2>&1 || \
 CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
 [ -n "$CHROMIUM_BIN" ] || die "chromium binary not found after install."
 
+# Window mode: one URL → locked full-screen --kiosk (no tab bar). Multiple URLs
+# → a maximised window that keeps the tab strip visible so the operator can
+# switch tabs (Ctrl+Tab / Ctrl+PgUp,PgDn). Each URL becomes its own tab.
+COMMON_FLAGS="--noerrdialogs --disable-infobars --disable-session-crashed-bubble --disable-features=Translate --no-first-run --check-for-update-interval=31536000 --password-store=basic"
+if [ "${#URLS[@]}" -gt 1 ]; then
+  WINDOW_FLAGS="--start-maximized"
+else
+  WINDOW_FLAGS="--kiosk"
+fi
+
+# systemd parses '%' in ExecStart as a specifier prefix; a URL with a literal
+# '%' (e.g. percent-encoded chars) would be mangled. Escape '%' as '%%'.
+URL_ARGS="${URLS[*]}"
+URL_ARGS="${URL_ARGS//%/%%}"
+
 info "Writing kiosk unit to $UNIT_FILE"
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_FILE" <<EOF
@@ -230,7 +268,7 @@ Type=simple
 ExecStartPre=-/usr/bin/xset s off
 ExecStartPre=-/usr/bin/xset s noblank
 ExecStartPre=-/usr/bin/xset -dpms
-ExecStart=$CHROMIUM_BIN --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble --disable-features=Translate --no-first-run --check-for-update-interval=31536000 --password-store=basic $URL
+ExecStart=$CHROMIUM_BIN $WINDOW_FLAGS $COMMON_FLAGS $URL_ARGS
 Restart=on-failure
 RestartSec=2
 

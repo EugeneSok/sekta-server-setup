@@ -1023,10 +1023,25 @@ kiosk_display(){
     confirm "Все одно спробувати?" || { warn "Пропущено."; return 0; }
   fi
 
-  # URL дашборда, який відкриє kiosk
-  local url
-  read -rp "URL, який відкривати в kiosk [${KIOSK_DEFAULT_URL}]: " url || true
-  url="${url:-$KIOSK_DEFAULT_URL}"
+  # URL(и) дашборда, який відкриє kiosk. Можна до 3 сайтів — тоді kiosk
+  # відкриється на весь екран із вкладками й перемиканням між ними.
+  local urls=() u
+  read -rp "URL, який відкривати в kiosk [${KIOSK_DEFAULT_URL}]: " u || true
+  u="${u:-$KIOSK_DEFAULT_URL}"
+  urls+=("$u")
+
+  while (( ${#urls[@]} < 3 )); do
+    confirm "Відкрити ще один сайт (вкладку)?" || break
+    read -rp "URL сайту #$(( ${#urls[@]} + 1 )): " u || true
+    if [[ -z "$u" ]]; then
+      warn "Порожній URL — пропущено."
+      continue
+    fi
+    urls+=("$u")
+  done
+
+  # KIOSK_URL передаємо як пробіл-розділені URL; інсталятор їх розбирає
+  local url="${urls[*]}"
 
   # інсталятор ВІДМОВЛЯЄТЬСЯ від root → запускаємо від звичайного користувача
   local runas="${SUDO_USER:-}"
@@ -1039,7 +1054,12 @@ kiosk_display(){
   fi
 
   echo
-  warn "Kiosk відкриє: ${BLD}${url}${RST}"
+  if (( ${#urls[@]} > 1 )); then
+    warn "Kiosk відкриє ${BLD}${#urls[@]}${RST} сайти у вкладках (перемикання Ctrl+Tab):"
+    local i=1; for u in "${urls[@]}"; do info "  вкладка $i: ${BLD}${u}${RST}"; i=$((i+1)); done
+  else
+    warn "Kiosk відкриє: ${BLD}${url}${RST}"
+  fi
   [[ -n "$runas" ]] && info "Запуск від користувача: ${BLD}${runas}${RST}"
   confirm "Встановити kiosk зараз?" || { warn "Скасовано."; return 0; }
 
