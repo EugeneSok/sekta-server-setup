@@ -1079,6 +1079,64 @@ kiosk_display(){
 }
 
 # ============================================================
+#  МОДУЛЬ 11: Sekta APP (Debian) — kiosk-дисплей із застосунком
+#  Те саме, що Kiosk-дисплей (boot-splash, автовхід, UA-клавіатура, без сну),
+#  але на екрані замість Chromium — застосунок Sekta APP (збірка для Debian,
+#  лише «Інструменти»), на весь екран. Ставить/оновлює АКТУАЛЬНУ версію з
+#  GitHub Releases (sekta-app, SHA-256). Повторний запуск = оновлення.
+# ============================================================
+sekta_app_kiosk(){
+  echo
+  echo "${BLD}=== Sekta APP (Debian) — kiosk-дисплей із застосунком ===${RST}"
+  warn "Цей модуль — для ${BLD}машини-дисплея${RST} (Debian 12+, amd64, з графічним"
+  warn "робочим столом), а не для PVE-хоста. Запускай його на самому дисплеї."
+  info "Ставить: Plymouth boot-splash з логотипом SEKTA + актуальну версію"
+  info "Sekta APP, що стартує після входу на весь екран (systemd --user unit)."
+  info "Вхід у застосунок — контрольною фразою «Інструментів»."
+  echo
+
+  local arch; arch="$(dpkg --print-architecture 2>/dev/null || echo '?')"
+  if [[ "$arch" != "amd64" ]]; then
+    err "Sekta APP зібрано лише для amd64 (ця машина: ${arch})."
+    return 0
+  fi
+
+  if ! curl -fsI "${KIOSK_RAW}/install.sh" >/dev/null 2>&1 \
+     || ! curl -fsI "https://api.github.com/repos/EugeneSok/sekta-app/releases/latest" >/dev/null 2>&1; then
+    warn "Немає доступу до GitHub — потрібен інтернет (інсталятор і реліз застосунку)."
+    confirm "Все одно спробувати?" || { warn "Пропущено."; return 0; }
+  fi
+
+  # інсталятор ВІДМОВЛЯЄТЬСЯ від root → запускаємо від звичайного користувача
+  local runas="${SUDO_USER:-}"
+  if [[ $EUID -eq 0 && -z "$runas" ]]; then
+    read -rp "Користувач дисплея (він має мати sudo): " runas || true
+    [[ -n "$runas" ]] || { err "Потрібен звичайний користувач — kiosk не ставиться під root."; return 0; }
+  fi
+  if [[ -n "$runas" ]] && ! id "$runas" >/dev/null 2>&1; then
+    die "Користувача '$runas' не існує."
+  fi
+
+  echo
+  warn "Якщо на машині вже стоїть Chromium-kiosk (пункт 8) — його буде замінено."
+  [[ -n "$runas" ]] && info "Запуск від користувача: ${BLD}${runas}${RST}"
+  confirm "Встановити Sekta APP kiosk зараз?" || { warn "Скасовано."; return 0; }
+
+  local tmp; tmp="$(mktemp)"
+  curl -fsSL "${KIOSK_RAW}/install.sh" -o "$tmp" || { rm -f "$tmp"; die "Не завантажив install.sh."; }
+  chmod 0644 "$tmp"   # mktemp дає 600/root → цільовий користувач не прочитає
+  if [[ -n "$runas" ]]; then
+    sudo -u "$runas" -H KIOSK_APP=1 bash "$tmp"
+  else
+    KIOSK_APP=1 bash "$tmp"
+  fi
+  rm -f "$tmp"
+  echo
+  ok "Sekta APP kiosk встановлено."
+  info "Оновити застосунок пізніше — запустити цей пункт ще раз (або оновлення в самому застосунку)."
+}
+
+# ============================================================
 #  MAIN
 # ============================================================
 # Модулі запускаються у субшелі (див. case у main), тому «reboot потрібен»
@@ -1097,9 +1155,10 @@ show_menu(){
   echo "  6) Debian VM (актуальний ISO + створення)"
   echo "  7) Кнопка живлення → reboot VM"
   echo "  8) Kiosk-дисплей (Chromium + boot splash) — на машині-дисплеї"
+  echo "  9) Sekta APP (Debian) — kiosk-дисплей із застосунком"
   echo "  ${DIM}— опційні мережеві сервіси —${RST}"
-  echo "  9) OPNsense VM (WAN + LAN) ${DIM}[опційно]${RST}"
-  echo "  10) LXC Pi-hole (DNS-фільтр) ${DIM}[опційно]${RST}"
+  echo "  10) OPNsense VM (WAN + LAN) ${DIM}[опційно]${RST}"
+  echo "  11) LXC Pi-hole (DNS-фільтр) ${DIM}[опційно]${RST}"
   echo "  q) Вихід"
   [[ -e "$GPU_REBOOT_FLAG" ]] && echo "  ${YEL}* очікує REBOOT для застосування GPU passthrough${RST}"
   echo
@@ -1136,8 +1195,9 @@ main(){
       6) ( debian_vm ) ;;
       7) ( power_button_vm ) ;;
       8) ( kiosk_display ) ;;
-      9) ( opnsense_vm ) ;;
-      10) ( pihole_lxc ) ;;
+      9) ( sekta_app_kiosk ) ;;
+      10) ( opnsense_vm ) ;;
+      11) ( pihole_lxc ) ;;
       q|Q) finish ;;
       *) warn "Невірний вибір: '$ch'"; continue ;;
     esac

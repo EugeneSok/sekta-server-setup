@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# SEKTA kiosk — one-command installer (Plymouth splash + Chromium kiosk)
+# SEKTA kiosk — one-command installer (Plymouth splash + Chromium or Sekta APP kiosk)
 #
 #   1) Plymouth boot splash with a centered logo (from 1.md)
 #   2) Chromium kiosk autostart via a systemd --user unit (from 2.md)
@@ -19,12 +19,26 @@
 # strip stays visible so the operator can switch):
 #   curl -fsSL .../install.sh | KIOSK_URL="https://a.omega https://b.omega" bash
 #
+# Sekta APP kiosk (Debian 12+, amd64): instead of Chromium, install the LATEST
+# Sekta APP .deb from GitHub Releases (SHA-256 verified) and run it full-screen
+# (`sekta --fullscreen`). Re-running the same command updates the app.
+#   curl -fsSL .../install.sh | KIOSK_APP=1 bash
+#
 set -euo pipefail
 
 REPO_RAW="https://raw.githubusercontent.com/EugeneSok/sekta-server-setup/main/kiosk"
 THEME_DIR="/usr/share/plymouth/themes/mylogo"
 DEFAULT_URL="https://combat.omega"
-SERVICE="chromium-kiosk.service"
+# Two kiosk flavours share everything except what runs on screen:
+#   browser (default) — Chromium with up to 3 sites
+#   app (KIOSK_APP=1)  — Sekta APP (Debian build, «Інструменти» only)
+APP_MODE=""
+case "${KIOSK_APP:-}" in 1|yes|true) APP_MODE=1 ;; esac
+APP_RELEASES_API="https://api.github.com/repos/EugeneSok/sekta-app/releases/latest"
+APP_ASSET="sekta-linux-amd64.deb"
+BROWSER_SERVICE="chromium-kiosk.service"
+APP_SERVICE="sekta-kiosk.service"
+if [ -n "$APP_MODE" ]; then SERVICE="$APP_SERVICE"; else SERVICE="$BROWSER_SERVICE"; fi
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT_FILE="$UNIT_DIR/$SERVICE"
 
@@ -46,11 +60,13 @@ export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNT
 # kiosk runs locked in --kiosk mode. With >1 URL it opens them as browser tabs
 # in a maximised window so the operator can see and switch between them.
 URLS=()
-if [ -n "${KIOSK_URL:-}" ]; then
+if [ -n "$APP_MODE" ]; then
+  : # app mode — no URLs, the app is the kiosk
+elif [ -n "${KIOSK_URL:-}" ]; then
   # split the env value on whitespace into the URL array
   read -r -a URLS <<< "$KIOSK_URL"
 fi
-if [ "${#URLS[@]}" -eq 0 ] && [ -r /dev/tty ]; then
+if [ -z "$APP_MODE" ] && [ "${#URLS[@]}" -eq 0 ] && [ -r /dev/tty ]; then
   printf 'Address to open in kiosk [%s]: ' "$DEFAULT_URL" > /dev/tty
   read -r first < /dev/tty || true
   URLS+=("${first:-$DEFAULT_URL}")
@@ -64,9 +80,11 @@ if [ "${#URLS[@]}" -eq 0 ] && [ -r /dev/tty ]; then
     [ -n "$more" ] && URLS+=("$more")
   done
 fi
-[ "${#URLS[@]}" -eq 0 ] && URLS+=("$DEFAULT_URL")
+[ -z "$APP_MODE" ] && [ "${#URLS[@]}" -eq 0 ] && URLS+=("$DEFAULT_URL")
 
-if [ "${#URLS[@]}" -gt 1 ]; then
+if [ -n "$APP_MODE" ]; then
+  info "Kiosk: Sekta APP (latest release, full screen)"
+elif [ "${#URLS[@]}" -gt 1 ]; then
   info "Kiosk URLs (${#URLS[@]} tabs): ${URLS[*]}"
 else
   info "Kiosk URL: ${URLS[0]}"
@@ -77,8 +95,10 @@ fi
 # them before reinstalling. Set REINSTALL=keep to skip and overwrite in place.
 detect_existing() {
   [ -d "$THEME_DIR" ] && return 0
-  [ -f "$UNIT_FILE" ] && return 0
-  systemctl --user list-unit-files 2>/dev/null | grep -q "^$SERVICE" && return 0
+  for svc in "$BROWSER_SERVICE" "$APP_SERVICE"; do
+    [ -f "$UNIT_DIR/$svc" ] && return 0
+    systemctl --user list-unit-files 2>/dev/null | grep -q "^$svc" && return 0
+  done
   return 1
 }
 
@@ -88,11 +108,14 @@ if detect_existing; then
   else
     warn "Existing kiosk-splash install detected — removing it before reinstall."
 
-    # Stop + disable the kiosk service, then drop its unit file.
-    if systemctl --user list-unit-files 2>/dev/null | grep -q "^$SERVICE"; then
-      systemctl --user disable --now "$SERVICE" 2>/dev/null || true
-    fi
-    rm -f "$UNIT_FILE"
+    # Stop + disable BOTH kiosk flavours (switching browser ⇄ app must not
+    # leave the other one starting on boot), then drop their unit files.
+    for svc in "$BROWSER_SERVICE" "$APP_SERVICE"; do
+      if systemctl --user list-unit-files 2>/dev/null | grep -q "^$svc"; then
+        systemctl --user disable --now "$svc" 2>/dev/null || true
+      fi
+      rm -f "$UNIT_DIR/$svc"
+    done
     systemctl --user daemon-reload 2>/dev/null || true
 
     # Drop the old Plymouth theme dir.
@@ -212,7 +235,7 @@ else
 fi
 
 # ============================================================================
-# PART 2 — Chromium kiosk systemd --user unit
+# PART 2 — kiosk systemd --user unit (Chromium, or Sekta APP with KIOSK_APP=1)
 # ============================================================================
 # Check that a graphical desktop is present; without one the kiosk can't start.
 if [ -z "${XDG_CURRENT_DESKTOP:-}${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] \
@@ -221,43 +244,83 @@ if [ -z "${XDG_CURRENT_DESKTOP:-}${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] \
   warn "and a graphical autologin, otherwise the kiosk service will not start."
 fi
 
-info "Installing chromium..."
-if apt-cache show chromium >/dev/null 2>&1; then
-  sudo apt-get install -y chromium
-elif apt-cache show chromium-browser >/dev/null 2>&1; then
-  sudo apt-get install -y chromium-browser
+# Install / update Sekta APP: latest GitHub release, SHA-256 verified, apt
+# resolves dependencies. The .deb is built only for amd64.
+install_sekta_app() {
+  local arch; arch="$(dpkg --print-architecture)"
+  [ "$arch" = "amd64" ] || die "Sekta APP is built for amd64 only (this machine: $arch)."
+  sudo apt-get install -y ca-certificates curl >/dev/null
+  info "Looking up the latest Sekta APP release..."
+  local json url tag tmp
+  json="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$APP_RELEASES_API")" \
+    || die "Cannot reach GitHub Releases ($APP_RELEASES_API)."
+  tag="$(printf '%s' "$json" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+  url="$(printf '%s' "$json" | grep -o "\"browser_download_url\": *\"[^\"]*/$APP_ASSET\"" \
+    | sed -E 's/.*"(https[^"]+)"$/\1/' | head -1)"
+  [ -n "$url" ] || die "Release ${tag:-latest} has no $APP_ASSET (Linux build missing?)."
+  tmp="$(mktemp -d)"
+  info "Downloading $APP_ASSET ($tag)..."
+  curl -fsSL "$url" -o "$tmp/$APP_ASSET" || die "Download failed: $url"
+  curl -fsSL "$url.sha256" -o "$tmp/$APP_ASSET.sha256" || die "Checksum download failed."
+  # The .sha256 file is "<hash>  <name>"; verify against our local file name.
+  (cd "$tmp" && awk -v f="$APP_ASSET" '{print $1"  "f}' "$APP_ASSET.sha256" | sha256sum -c --status) \
+    || { rm -rf "$tmp"; die "SHA-256 mismatch for $APP_ASSET — not installing."; }
+  # apt (not dpkg) so missing libraries are pulled in; _apt must read the file.
+  chmod 755 "$tmp"; chmod 644 "$tmp/$APP_ASSET"
+  sudo apt-get install -y "$tmp/$APP_ASSET"
+  rm -rf "$tmp"
+  command -v sekta >/dev/null 2>&1 || die "sekta binary not found after install."
+  info "Sekta APP installed: $(dpkg-query -W -f='${Version}' sekta 2>/dev/null)"
+}
+
+if [ -n "$APP_MODE" ]; then
+  install_sekta_app
+  sudo apt-get install -y x11-xserver-utils >/dev/null 2>&1 || \
+    warn "Could not install x11-xserver-utils (screen-blanking disable may not work)."
+  KIOSK_EXEC="/usr/bin/sekta --fullscreen"
+  KIOSK_DESC="Sekta APP kiosk (user)"
 else
-  warn "No chromium package found in apt; assuming it is already installed."
+  info "Installing chromium..."
+  if apt-cache show chromium >/dev/null 2>&1; then
+    sudo apt-get install -y chromium
+  elif apt-cache show chromium-browser >/dev/null 2>&1; then
+    sudo apt-get install -y chromium-browser
+  else
+    warn "No chromium package found in apt; assuming it is already installed."
+  fi
+
+  # x11 utilities for disabling screen blanking / DPMS (no-op under Wayland)
+  sudo apt-get install -y x11-xserver-utils >/dev/null 2>&1 || \
+    warn "Could not install x11-xserver-utils (screen-blanking disable may not work)."
+
+  # Resolve the chromium binary
+  CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
+  [ -n "$CHROMIUM_BIN" ] || die "chromium binary not found after install."
+
+  # Window mode: one URL → locked full-screen --kiosk (no tab bar). Multiple URLs
+  # → a maximised window that keeps the tab strip visible so the operator can
+  # switch tabs (Ctrl+Tab / Ctrl+PgUp,PgDn). Each URL becomes its own tab.
+  COMMON_FLAGS="--noerrdialogs --disable-infobars --disable-session-crashed-bubble --disable-features=Translate --no-first-run --check-for-update-interval=31536000 --password-store=basic"
+  if [ "${#URLS[@]}" -gt 1 ]; then
+    WINDOW_FLAGS="--start-maximized"
+  else
+    WINDOW_FLAGS="--kiosk"
+  fi
+
+  # systemd parses '%' in ExecStart as a specifier prefix; a URL with a literal
+  # '%' (e.g. percent-encoded chars) would be mangled. Escape '%' as '%%'.
+  URL_ARGS="${URLS[*]}"
+  URL_ARGS="${URL_ARGS//%/%%}"
+
+  KIOSK_EXEC="$CHROMIUM_BIN $WINDOW_FLAGS $COMMON_FLAGS $URL_ARGS"
+  KIOSK_DESC="Browser Kiosk (user)"
 fi
-
-# x11 utilities for disabling screen blanking / DPMS (no-op under Wayland)
-sudo apt-get install -y x11-xserver-utils >/dev/null 2>&1 || \
-  warn "Could not install x11-xserver-utils (screen-blanking disable may not work)."
-
-# Resolve the chromium binary
-CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
-[ -n "$CHROMIUM_BIN" ] || die "chromium binary not found after install."
-
-# Window mode: one URL → locked full-screen --kiosk (no tab bar). Multiple URLs
-# → a maximised window that keeps the tab strip visible so the operator can
-# switch tabs (Ctrl+Tab / Ctrl+PgUp,PgDn). Each URL becomes its own tab.
-COMMON_FLAGS="--noerrdialogs --disable-infobars --disable-session-crashed-bubble --disable-features=Translate --no-first-run --check-for-update-interval=31536000 --password-store=basic"
-if [ "${#URLS[@]}" -gt 1 ]; then
-  WINDOW_FLAGS="--start-maximized"
-else
-  WINDOW_FLAGS="--kiosk"
-fi
-
-# systemd parses '%' in ExecStart as a specifier prefix; a URL with a literal
-# '%' (e.g. percent-encoded chars) would be mangled. Escape '%' as '%%'.
-URL_ARGS="${URLS[*]}"
-URL_ARGS="${URL_ARGS//%/%%}"
 
 info "Writing kiosk unit to $UNIT_FILE"
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_FILE" <<EOF
 [Unit]
-Description=Browser Kiosk (user)
+Description=$KIOSK_DESC
 After=graphical-session.target
 PartOf=graphical-session.target
 
@@ -268,7 +331,7 @@ Type=simple
 ExecStartPre=-/usr/bin/xset s off
 ExecStartPre=-/usr/bin/xset s noblank
 ExecStartPre=-/usr/bin/xset -dpms
-ExecStart=$CHROMIUM_BIN $WINDOW_FLAGS $COMMON_FLAGS $URL_ARGS
+ExecStart=$KIOSK_EXEC
 Restart=on-failure
 RestartSec=2
 
