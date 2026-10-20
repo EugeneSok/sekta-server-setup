@@ -19,7 +19,7 @@
 # strip stays visible so the operator can switch):
 #   curl -fsSL .../install.sh | KIOSK_URL="https://a.omega https://b.omega" bash
 #
-# Sekta APP kiosk (Debian 12+, amd64): instead of Chromium, install the LATEST
+# Sekta APP kiosk (Debian 12+, amd64 or arm64): instead of Chromium, install the LATEST
 # Sekta APP .deb from GitHub Releases (SHA-256 verified) and run it full-screen
 # (`sekta --fullscreen`). Re-running the same command updates the app.
 #   curl -fsSL .../install.sh | KIOSK_APP=1 bash
@@ -35,7 +35,9 @@ DEFAULT_URL="https://combat.omega"
 APP_MODE=""
 case "${KIOSK_APP:-}" in 1|yes|true) APP_MODE=1 ;; esac
 APP_RELEASES_API="https://api.github.com/repos/EugeneSok/sekta-app/releases/latest"
-APP_ASSET="sekta-linux-amd64.deb"
+# Release asset per CPU architecture (set in install_sekta_app):
+#   sekta-linux-amd64.deb / sekta-linux-arm64.deb (since Sekta APP 1.7.2).
+APP_ASSET=""
 BROWSER_SERVICE="chromium-kiosk.service"
 APP_SERVICE="sekta-kiosk.service"
 if [ -n "$APP_MODE" ]; then SERVICE="$APP_SERVICE"; else SERVICE="$BROWSER_SERVICE"; fi
@@ -245,10 +247,13 @@ if [ -z "${XDG_CURRENT_DESKTOP:-}${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] \
 fi
 
 # Install / update Sekta APP: latest GitHub release, SHA-256 verified, apt
-# resolves dependencies. The .deb is built only for amd64.
+# resolves dependencies. Built for amd64 and arm64 (Raspberry Pi 4/5 etc.).
 install_sekta_app() {
   local arch; arch="$(dpkg --print-architecture)"
-  [ "$arch" = "amd64" ] || die "Sekta APP is built for amd64 only (this machine: $arch)."
+  case "$arch" in
+    amd64|arm64) APP_ASSET="sekta-linux-$arch.deb" ;;
+    *) die "Sekta APP is built for amd64 and arm64 only (this machine: $arch)." ;;
+  esac
   sudo apt-get install -y ca-certificates curl >/dev/null
   info "Looking up the latest Sekta APP release..."
   local json url tag tmp

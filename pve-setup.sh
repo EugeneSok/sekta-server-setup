@@ -1088,7 +1088,7 @@ kiosk_display(){
 sekta_app_kiosk(){
   echo
   echo "${BLD}=== Sekta APP (Debian) — kiosk-дисплей із застосунком ===${RST}"
-  warn "Цей модуль — для ${BLD}машини-дисплея${RST} (Debian 12+, amd64, з графічним"
+  warn "Цей модуль — для ${BLD}машини-дисплея${RST} (Debian 12+, amd64 або arm64, з графічним"
   warn "робочим столом), а не для PVE-хоста. Запускай його на самому дисплеї."
   info "Ставить: Plymouth boot-splash з логотипом SEKTA + актуальну версію"
   info "Sekta APP, що стартує після входу на весь екран (systemd --user unit)."
@@ -1096,8 +1096,8 @@ sekta_app_kiosk(){
   echo
 
   local arch; arch="$(dpkg --print-architecture 2>/dev/null || echo '?')"
-  if [[ "$arch" != "amd64" ]]; then
-    err "Sekta APP зібрано лише для amd64 (ця машина: ${arch})."
+  if [[ "$arch" != "amd64" && "$arch" != "arm64" ]]; then
+    err "Sekta APP зібрано для amd64 і arm64 (ця машина: ${arch})."
     return 0
   fi
 

@@ -18,8 +18,9 @@ cd sekta-server-setup/kiosk
 
 ## Sekta APP kiosk (instead of Chromium)
 
-On Debian 12+ (amd64) with a desktop, run the **Sekta APP** full screen instead
-of a browser. The installer downloads the **latest** `sekta-linux-amd64.deb`
+On Debian 12+ (amd64 or arm64) with a desktop, run the **Sekta APP** full screen
+instead of a browser. The installer downloads the **latest** `sekta-linux-<arch>.deb`
+(`amd64` or `arm64`, picked by `dpkg --print-architecture`; arm64 since 1.7.2)
 from GitHub Releases (`EugeneSok/sekta-app`), verifies its SHA-256 and installs
 it with `apt` (dependencies included). Re-run to update the app.
 
