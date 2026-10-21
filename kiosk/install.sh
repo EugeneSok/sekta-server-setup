@@ -108,7 +108,7 @@ detect_existing() {
   [ -d "$THEME_DIR" ] && return 0
   for svc in "$BROWSER_SERVICE" "$APP_SERVICE"; do
     [ -f "$UNIT_DIR/$svc" ] && return 0
-    systemctl --user list-unit-files 2>/dev/null | grep -q "^$svc" && return 0
+    systemctl --user list-unit-files 2>/dev/null | grep "^$svc" >/dev/null && return 0
   done
   return 1
 }
@@ -122,7 +122,7 @@ if detect_existing; then
     # Stop + disable BOTH kiosk flavours (switching browser ⇄ app must not
     # leave the other one starting on boot), then drop their unit files.
     for svc in "$BROWSER_SERVICE" "$APP_SERVICE"; do
-      if systemctl --user list-unit-files 2>/dev/null | grep -q "^$svc"; then
+      if systemctl --user list-unit-files 2>/dev/null | grep "^$svc" >/dev/null; then
         systemctl --user disable --now "$svc" 2>/dev/null || true
       fi
       rm -f "$UNIT_DIR/$svc" "$UNIT_DIR/graphical-session.target.wants/$svc"
@@ -252,8 +252,11 @@ fi
 # PART 2 — kiosk systemd --user unit (Chromium, or Sekta APP with KIOSK_APP=1)
 # ============================================================================
 # Check that a graphical desktop is present; without one the kiosk can't start.
+# NB: no `grep -q` after systemctl here — with `set -o pipefail` it exits on the
+# first match, systemctl dies of SIGPIPE (rc 141) and the check reads as
+# "no desktop" (false warning on Raspberry Pi OS with LightDM + labwc).
 if [ -z "${XDG_CURRENT_DESKTOP:-}${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] \
-   && ! systemctl list-unit-files 2>/dev/null | grep -qE 'gdm|sddm|lightdm|graphical.target'; then
+   && ! systemctl list-unit-files 2>/dev/null | grep -E 'gdm|sddm|lightdm|graphical.target' >/dev/null; then
   warn "No graphical session/desktop detected. Install a desktop (e.g. a display manager)"
   warn "and a graphical autologin, otherwise the kiosk service will not start."
 fi
@@ -461,7 +464,7 @@ fi
 # Display DPMS is already handled per-session by xset in the kiosk unit. Here we
 # stop the *machine* from suspending and stop the VT console from blanking.
 info "Screen sleep: checking system suspend/sleep state..."
-if systemctl is-enabled sleep.target suspend.target 2>/dev/null | grep -q masked; then
+if systemctl is-enabled sleep.target suspend.target 2>/dev/null | grep masked >/dev/null; then
   info "Sleep/suspend already masked."
 else
   sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target \
@@ -483,7 +486,7 @@ info "Autologin: detecting display manager for user '$USER'..."
 autologin_done=""
 
 # GDM3 (GNOME)
-if [ -d /etc/gdm3 ] || systemctl list-unit-files 2>/dev/null | grep -q '^gdm'; then
+if [ -d /etc/gdm3 ] || systemctl list-unit-files 2>/dev/null | grep '^gdm' >/dev/null; then
   GDM_CONF=/etc/gdm3/daemon.conf
   sudo mkdir -p /etc/gdm3
   [ -f "$GDM_CONF" ] && sudo cp -a "$GDM_CONF" "$GDM_CONF.bak.$(date +%s)"
@@ -504,7 +507,7 @@ if [ -d /etc/gdm3 ] || systemctl list-unit-files 2>/dev/null | grep -q '^gdm'; t
 fi
 
 # LightDM
-if [ -z "$autologin_done" ] && { [ -d /etc/lightdm ] || systemctl list-unit-files 2>/dev/null | grep -q '^lightdm'; }; then
+if [ -z "$autologin_done" ] && { [ -d /etc/lightdm ] || systemctl list-unit-files 2>/dev/null | grep '^lightdm' >/dev/null; }; then
   sudo mkdir -p /etc/lightdm/lightdm.conf.d
   sudo tee /etc/lightdm/lightdm.conf.d/50-kiosk-autologin.conf >/dev/null <<EOF
 [Seat:*]

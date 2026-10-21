@@ -57,7 +57,7 @@ info "Kiosk URL: $URL"
 detect_existing() {
   [ -d "$THEME_DIR" ] && return 0
   [ -f "$UNIT_FILE" ] && return 0
-  systemctl --user list-unit-files 2>/dev/null | grep -q "^$SERVICE" && return 0
+  systemctl --user list-unit-files 2>/dev/null | grep "^$SERVICE" >/dev/null && return 0
   return 1
 }
 
@@ -66,7 +66,7 @@ if detect_existing; then
     warn "Existing install detected — REINSTALL=keep set, overwriting in place."
   else
     warn "Existing kiosk-splash install detected — removing it before reinstall."
-    if systemctl --user list-unit-files 2>/dev/null | grep -q "^$SERVICE"; then
+    if systemctl --user list-unit-files 2>/dev/null | grep "^$SERVICE" >/dev/null; then
       systemctl --user disable --now "$SERVICE" 2>/dev/null || true
     fi
     rm -f "$UNIT_FILE" "$UNIT_DIR/graphical-session.target.wants/$SERVICE"
@@ -179,7 +179,7 @@ fi
 # PART 2 — Chromium kiosk systemd --user unit
 # ============================================================================
 if [ -z "${XDG_CURRENT_DESKTOP:-}${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] \
-   && ! systemctl list-unit-files 2>/dev/null | grep -qE 'gdm|sddm|lightdm|graphical.target'; then
+   && ! systemctl list-unit-files 2>/dev/null | grep -E 'gdm|sddm|lightdm|graphical.target' >/dev/null; then
   warn "No graphical session/desktop detected. Install a desktop (e.g. a display manager)"
   warn "and a graphical autologin, otherwise the kiosk service will not start."
 fi
