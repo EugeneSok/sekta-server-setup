@@ -33,6 +33,17 @@ existing `chromium-kiosk.service` is removed so only one runs on boot. Plymouth
 splash, autologin, UA keyboard and no-sleep are the same as the browser kiosk.
 Offline install covers the browser kiosk only.
 
+**Autostart.** The kiosk unit is started by the graphical session, not by
+`graphical-session.target`: labwc / wayfire (Raspberry Pi OS, plain Debian)
+never activate that target, so a unit wanted by it did not start after a
+reboot. The installer writes `~/.local/bin/sekta-kiosk-start` (hands
+`WAYLAND_DISPLAY`/`DISPLAY` to the user manager, then
+`systemctl --user start <unit>`) and calls it from
+`~/.config/autostart/sekta-kiosk.desktop` and `~/.config/labwc/autostart`
+(seeded from `/etc/xdg/labwc/autostart` so the panel stays). Re-run the
+installer on machines set up before this change. Check after a reboot:
+`systemctl --user status sekta-kiosk.service`.
+
 ## Offline install
 
 Gather packages once on an online Debian machine of the **same arch + release**
