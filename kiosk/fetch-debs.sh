@@ -7,7 +7,8 @@
 #   - architecture  (arm64 for Raspberry Pi, amd64 for a Debian PC)
 #   - release        (bookworm, bullseye, ...)
 #
-# It downloads plymouth, chromium, x11-xserver-utils and every dependency into
+# It downloads plymouth, chromium, x11-xserver-utils, keyboard-configuration,
+# console-setup and every dependency into
 # ./debs, so install-offline.sh can later install them with no network.
 #
 # apt resolves ONE consistent package set as if the target had nothing
@@ -46,7 +47,8 @@ else
 fi
 info "Chromium package: $CHROMIUM_PKG"
 
-PKGS=(plymouth plymouth-themes "$CHROMIUM_PKG" x11-xserver-utils)
+# keyboard-configuration / console-setup: UA layout (PART 3a of install-offline.sh)
+PKGS=(plymouth plymouth-themes "$CHROMIUM_PKG" x11-xserver-utils keyboard-configuration console-setup)
 
 # Old bundle out: a stale mix of versions/alternatives must not reach the target.
 mkdir -p "$OUT/partial"

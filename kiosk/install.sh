@@ -471,15 +471,17 @@ info "Keyboard: ensuring Ukrainian layout (us,ua — switch Alt+Shift)..."
 if [ -f /etc/default/keyboard ] && grep -qE 'XKBLAYOUT="[^"]*\bua\b' /etc/default/keyboard; then
   info "Ukrainian layout already configured."
 else
-  sudo apt-get install -y keyboard-configuration console-setup >/dev/null 2>&1 || \
+  # noninteractive: output goes to /dev/null, a debconf layout dialog would hang unseen
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y keyboard-configuration console-setup >/dev/null 2>&1 || \
     warn "Could not install keyboard-configuration/console-setup."
   [ -f /etc/default/keyboard ] && \
     sudo cp -a /etc/default/keyboard "/etc/default/keyboard.bak.$(date +%s)"
-  if command -v localectl >/dev/null 2>&1; then
-    # localectl writes /etc/default/keyboard for X and console in one shot
-    sudo localectl set-x11-keymap us,ua pc105 "" grp:alt_shift_toggle 2>/dev/null || \
-      warn "localectl keymap set failed."
-  else
+  # localectl writes /etc/default/keyboard for X and console in one shot; it can
+  # exist yet fail (no running systemd-localed / dbus) — then write the file.
+  if ! { command -v localectl >/dev/null 2>&1 && \
+         sudo localectl set-x11-keymap us,ua pc105 "" grp:alt_shift_toggle 2>/dev/null; }; then
+    command -v localectl >/dev/null 2>&1 && \
+      warn "localectl keymap set failed — writing /etc/default/keyboard directly."
     sudo tee /etc/default/keyboard >/dev/null <<'EOF'
 XKBMODEL="pc105"
 XKBLAYOUT="us,ua"
@@ -490,7 +492,12 @@ EOF
   fi
   sudo dpkg-reconfigure -f noninteractive keyboard-configuration >/dev/null 2>&1 || true
   sudo setupcon --save 2>/dev/null || true
-  info "Ukrainian layout added (toggle: Alt+Shift)."
+  # report what is really on disk, not what was attempted
+  if grep -qE 'XKBLAYOUT="[^"]*\bua\b' /etc/default/keyboard 2>/dev/null; then
+    info "Ukrainian layout added (toggle: Alt+Shift)."
+  else
+    warn "Ukrainian layout NOT applied — check /etc/default/keyboard."
+  fi
 fi
 
 # --- 3b. Disable screen sleep / suspend --------------------------------------

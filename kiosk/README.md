@@ -46,9 +46,12 @@ installer on machines set up before this change. Check after a reboot:
 
 ## Offline install
 
+Same browser kiosk as `install.sh` — up to 3 sites as tabs, UA keyboard,
+no screen sleep, autologin — without network.
+
 Gather packages once on an online Debian machine of the **same arch + release**
-(amd64 / bookworm — ideally a clean image, since `apt-get download` skips
-already-installed packages):
+(amd64 / arm64, bookworm). apt resolves one consistent, complete set as if the
+target had nothing installed, so the online machine does not need to be clean:
 
 ```bash
 ./fetch-debs.sh
@@ -58,7 +61,12 @@ Copy the whole folder (including `debs/`) to the offline machine, then:
 
 ```bash
 ./install-offline.sh
+# or non-interactive, 1–3 sites:
+KIOSK_URL="https://a.omega https://b.omega" ./install-offline.sh
 ```
+
+Only packages missing on the target (or older than in `debs/`) are installed —
+newer system packages are never downgraded.
 
 ## Reboot
 
