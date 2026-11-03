@@ -4,7 +4,7 @@ Boot logo (Plymouth) + Chromium kiosk, or the Sekta APP (`KIOSK_APP=1`). One com
 
 Run on the **display machine** (not the PVE host) as a **normal user with sudo** —
 the installers refuse root and call `sudo` themselves. `pve-setup.sh` menu items
-8 (Chromium) and 9 (Sekta APP) run the same `install.sh`.
+7 (Chromium) and 8 (Sekta APP) run the same `install.sh`.
 
 ## Install
 

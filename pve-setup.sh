@@ -2,10 +2,15 @@
 #
 # pve-setup.sh — інтерактивне налаштування Proxmox VE (останні версії)
 #
-# Модулі:
-#   1) GPU passthrough (детект на хості, пріоритет iGPU, крок за кроком)
-#   2) Додатковий storage з USB-флешки (примусово exFAT, форматує якщо інший FS)
-#   3) Перевірка мережевих інтерфейсів + створення bridge на вільному
+# Модулі (номер = пункт меню = рекомендований порядок):
+#   1) Post-install: репозиторії no-subscription, прибрати nag, dist-upgrade
+#   2) GPU passthrough (детект на хості, пріоритет iGPU, крок за кроком)
+#   3) Перевірка IOMMU-груп (після reboot з п.2)
+#   4) Додатковий storage з USB-флешки (примусово exFAT, форматує якщо інший FS)
+#   5) Debian VM (актуальний netinst ISO, q35/UEFI)
+#   6) Кнопка живлення хоста → reboot обраної VM
+#   7) Kiosk-дисплей (Chromium) — на окремій машині-дисплеї
+#   8) Sekta APP kiosk — на окремій машині-дисплеї
 #
 # Запускати ТІЛЬКИ на хості Proxmox під root.
 # Кожна руйнівна дія — з окремим підтвердженням.
@@ -13,7 +18,7 @@
 set -euo pipefail
 
 # ----- кольори / лог -----
-RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; BLU=$'\e[34m'; BLD=$'\e[1m'; DIM=$'\e[2m'; RST=$'\e[0m'
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; BLU=$'\e[34m'; BLD=$'\e[1m'; RST=$'\e[0m'
 info(){ echo "${BLU}[i]${RST} $*"; }
 ok(){   echo "${GRN}[ok]${RST} $*"; }
 warn(){ echo "${YEL}[!]${RST} $*"; }
@@ -111,7 +116,7 @@ add_kernel_param(){
 }
 
 # ============================================================
-#  МОДУЛЬ 1: GPU passthrough
+#  МОДУЛЬ 2: GPU passthrough
 # ============================================================
 gpu_passthrough(){
   echo
@@ -232,7 +237,7 @@ gpu_passthrough(){
 }
 
 # ============================================================
-#  МОДУЛЬ 2: USB storage (exFAT)
+#  МОДУЛЬ 4: USB storage (exFAT)
 # ============================================================
 # Усі фізичні диски, що несуть кореневу ФС. Покриває три розкладки
 # кореня на PVE: bare-partition (/dev/sdX3), LVM (/dev/mapper/pve-root),
@@ -385,128 +390,7 @@ usb_storage(){
 }
 
 # ============================================================
-#  МОДУЛЬ 3: LAN bridge для OPNsense
-#  Існуючий інтерфейс (з uplink) = WAN, новий bridge = LAN.
-#  LAN-bridge БЕЗ IP на хості — OPNsense роутить і роздає DHCP.
-# ============================================================
-network_bridge(){
-  echo
-  echo "${BLD}=== LAN bridge для OPNsense ===${RST}"
-  info "Логіка: наявний інтерфейс = ${BLD}WAN${RST}, новий bridge = ${BLD}LAN${RST}."
-  info "LAN-bridge лишається без IP на хості — адресацію тримає OPNsense."
-
-  # --- визначити WAN (звідки йде uplink хоста) ---
-  local wan_dev wan_br
-  wan_dev="$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')"
-  if [[ -n "$wan_dev" ]]; then
-    if [[ "$wan_dev" == vmbr* ]]; then
-      wan_br="$wan_dev"
-      # фізичний порт цього bridge
-      local wp; wp="$(find /sys/class/net/"$wan_br"/brif -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | head -n1)"
-      info "WAN uplink: ${BLD}${wan_br}${RST} (порт: ${wp:-?}) — це буде net0/WAN у OPNsense."
-    else
-      # VM не підключиш напряму до NIC — для net0 потрібен bridge з цим портом
-      wan_br=""
-      info "WAN uplink: ${BLD}${wan_dev}${RST} (не bridge)."
-      warn "Для net0/WAN у OPNsense потрібен bridge з портом ${wan_dev} (напр. vmbr0)."
-    fi
-  else
-    warn "Не визначив default route — WAN вкажеш вручну в OPNsense."
-  fi
-
-  echo
-  echo "Наявні bridge:"
-  ip -br link show type bridge 2>/dev/null || true
-  echo
-
-  # --- знайти вільні фізичні NIC (кандидати на LAN): без IP, не в bridge ---
-  local -a free=()
-  local ifc
-  while read -r ifc; do
-    [[ "$ifc" =~ ^(lo|vmbr|veth|tap|fwbr|fwln|fwpr|bond|dummy) ]] && continue
-    [[ -e "/sys/class/net/$ifc/device" ]] || continue                 # реальний ethernet
-    [[ "$ifc" == "$wan_dev" ]] && continue                            # не чіпати WAN-порт
-    if ip -4 addr show "$ifc" 2>/dev/null | grep -q 'inet '; then continue; fi
-    if [[ -n "$(ls /sys/class/net/*/brif/"$ifc" 2>/dev/null)" ]]; then continue; fi
-    if grep -qE "bridge-ports.*\b${ifc}\b" /etc/network/interfaces 2>/dev/null; then continue; fi
-    free+=("$ifc")
-  done < <(ls /sys/class/net)
-
-  if [[ ${#free[@]} -eq 0 ]]; then
-    warn "Вільних фізичних інтерфейсів під LAN немає."
-    warn "Варіант: LAN як internal-only bridge (без фізичного порту) для VM-only мережі."
-    confirm "Створити LAN-bridge БЕЗ фізичного порту (internal)?" || { warn "Пропущено."; return 0; }
-    _make_lan_bridge "" "$wan_br"
-    return 0
-  fi
-
-  echo "Вільні інтерфейси (кандидати на LAN-порт):"
-  local n=0
-  for ifc in "${free[@]}"; do
-    local st; st="$(cat /sys/class/net/"$ifc"/operstate 2>/dev/null || echo '?')"
-    printf "  ${BLD}%d${RST}) %s  (state=%s)\n" "$n" "$ifc" "$st"
-    n=$((n+1))
-  done
-  echo
-  confirm "Створити LAN-bridge для OPNsense?" || { warn "Пропущено."; return 0; }
-
-  local sel
-  read -rp "Який інтерфейс як LAN-порт? [0] " sel || true; sel="${sel:-0}"
-  [[ "$sel" =~ ^[0-9]+$ && $sel -lt $n ]] || die "Невірний вибір."
-  _make_lan_bridge "${free[$sel]}" "$wan_br"
-}
-
-# створити LAN-bridge; $1=фізичний порт (порожньо=internal), $2=wan_br для підсумку
-_make_lan_bridge(){
-  local port="$1" wan_br="$2"
-
-  # наступний вільний vmbrN
-  local idx=0
-  while ip link show "vmbr${idx}" >/dev/null 2>&1; do idx=$((idx+1)); done
-  local br="vmbr${idx}"
-  info "Створюю LAN-bridge ${BLD}${br}${RST}${port:+ з портом ${BLD}${port}${RST}}"
-
-  cp -a /etc/network/interfaces "/etc/network/interfaces.bak.$(date +%s)"
-  {
-    echo ""
-    echo "# --- OPNsense LAN (створено pve-setup.sh) ---"
-    if [[ -n "$port" ]]; then
-      echo "auto ${port}"
-      echo "iface ${port} inet manual"
-      echo ""
-    fi
-    echo "auto ${br}"
-    echo "iface ${br} inet manual"          # без IP на хості — тримає OPNsense
-    echo "        bridge-ports ${port:-none}"
-    echo "        bridge-stp off"
-    echo "        bridge-fd 0"
-    echo "#         LAN bridge для OPNsense — приєднай як net1/LAN у VM"
-  } >> /etc/network/interfaces
-
-  ok "Додано LAN-bridge ${br} у /etc/network/interfaces (бекап збережено, без IP на хості)."
-  echo
-  info "Застосувати зараз через 'ifreload -a'?"
-  warn "WAN-зв'язок хоста не чіпається (LAN-порт окремий)."
-  if confirm "Виконати ifreload -a?"; then
-    if command -v ifreload >/dev/null 2>&1; then
-      ifreload -a && ok "Мережу перезавантажено."
-    else
-      warn "ifreload немає (ifupdown2 не стоїть). Застосуй вручну: systemctl restart networking"
-    fi
-  else
-    warn "Не застосовано. Застосуй пізніше: ifreload -a"
-  fi
-
-  echo
-  echo "${BLD}Мапа для OPNsense VM:${RST}"
-  echo "   net0 (WAN) → ${wan_br:-<твій WAN bridge>}"
-  echo "   net1 (LAN) → ${br}"
-  echo "   У VM conf: net0=virtio,bridge=${wan_br:-vmbr0}  net1=virtio,bridge=${br}"
-  echo "   Після інсталяції OPNsense признач: WAN=vtnet0, LAN=vtnet1."
-}
-
-# ============================================================
-#  МОДУЛЬ 4: кнопка живлення хоста → reboot VM
+#  МОДУЛЬ 6: кнопка живлення хоста → reboot VM
 # ============================================================
 power_button_vm(){
   echo
@@ -577,7 +461,7 @@ EOF
 }
 
 # ============================================================
-#  МОДУЛЬ 5: Post-install (repo + nag + upgrade)
+#  МОДУЛЬ 1: Post-install (repo + nag + upgrade)
 # ============================================================
 post_install(){
   echo
@@ -645,7 +529,7 @@ post_install(){
 }
 
 # ============================================================
-#  МОДУЛЬ 6: Debian VM (актуальний ISO + створення VM)
+#  МОДУЛЬ 5: Debian VM (актуальний ISO + створення VM)
 # ============================================================
 debian_vm(){
   echo
@@ -729,7 +613,7 @@ debian_vm(){
 }
 
 # ============================================================
-#  МОДУЛЬ 7: перевірка IOMMU-груп (чи GPU ізольована чисто)
+#  МОДУЛЬ 3: перевірка IOMMU-груп (чи GPU ізольована чисто)
 # ============================================================
 iommu_check(){
   echo
@@ -795,246 +679,7 @@ iommu_check(){
 }
 
 # ============================================================
-#  МОДУЛЬ 8: OPNsense VM (WAN+LAN, dvd ISO)
-# ============================================================
-opnsense_vm(){
-  echo
-  echo "${BLD}=== OPNsense VM (WAN + LAN) ===${RST}"
-  command -v qm >/dev/null 2>&1 || die "qm не знайдено — не хост Proxmox."
-
-  # --- знайти актуальний dvd ISO на дзеркалі ---
-  local mirror="${OPN_MIRROR:-https://mirror.dns-root.de/opnsense/releases/mirror/}"
-  info "Дзеркало OPNsense: ${mirror}"
-  local bz
-  bz="$(curl -fsSL "$mirror" 2>/dev/null | grep -oE 'OPNsense-[0-9.]+-dvd-amd64\.iso\.bz2' | sort -Vu | tail -n1 || true)"
-  local url
-  if [[ -n "$bz" ]]; then
-    url="${mirror}${bz}"
-    info "Знайдено: ${BLD}${bz}${RST}"
-  else
-    warn "Автопошук ISO не вдався."
-    read -rp "Встав пряме посилання на OPNsense dvd .iso.bz2: " url || true
-    [[ -n "$url" ]] || die "Немає URL ISO."
-    bz="$(basename "$url")"
-  fi
-
-  # --- завантажити + розпакувати в ISO storage ---
-  local isodir=/var/lib/vz/template/iso
-  mkdir -p "$isodir"
-  local iso="${bz%.bz2}"
-  local isopath="${isodir}/${iso}"
-  if [[ -f "$isopath" ]]; then
-    ok "ISO вже готовий: $isopath"
-  else
-    confirm "Завантажити й розпакувати ${bz}?" || { warn "Скасовано."; return 0; }
-    command -v bunzip2 >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y bzip2; }
-    info "Завантаження…"
-    curl -fL --progress-bar -o "${isodir}/${bz}" "$url"
-    info "Розпаковка bz2…"
-    bunzip2 -f "${isodir}/${bz}"
-    [[ -f "$isopath" ]] || die "Після розпаковки нема ${isopath}."
-    ok "ISO готовий: $isopath"
-  fi
-  local iso_ref="local:iso/${iso}"
-
-  # --- storage диска ---
-  local diskstore
-  diskstore="$(pvesm status -content images 2>/dev/null | awk 'NR>1{print $1}' | grep -x local-lvm || \
-               pvesm status -content images 2>/dev/null | awk 'NR>1{print $1; exit}')"
-  [[ -n "$diskstore" ]] || die "Немає storage з content=images."
-  read -rp "Storage для диска [${diskstore}]: " s || true; diskstore="${s:-$diskstore}"
-
-  # --- WAN bridge (default route) ---
-  local wan_br
-  wan_br="$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')"
-  [[ "$wan_br" == vmbr* ]] || wan_br=vmbr0
-  read -rp "WAN bridge (net0) [${wan_br}]: " w || true; wan_br="${w:-$wan_br}"
-
-  # --- LAN bridge: показати bridge крім WAN ---
-  echo "Наявні bridge:"
-  ip -br link show type bridge 2>/dev/null | awk '{print "   "$1}'
-  local lan_br
-  lan_br="$(ip -br link show type bridge 2>/dev/null | awk '{print $1}' | grep -v "^${wan_br}$" | head -n1)"
-  [[ -n "$lan_br" ]] || lan_br=vmbr1
-  read -rp "LAN bridge (net1) [${lan_br}]: " l || true; lan_br="${l:-$lan_br}"
-  [[ "$lan_br" == "$wan_br" ]] && die "LAN і WAN не можуть бути одним bridge."
-
-  # --- VMID (дефолт 400) ---
-  local vmid=400
-  if qm status "$vmid" >/dev/null 2>&1; then
-    vmid="$(pvesh get /cluster/nextid 2>/dev/null || echo 401)"
-    warn "VMID 400 зайнятий → ${vmid}."
-  fi
-  read -rp "VMID [${vmid}]: " v || true; vmid="${v:-$vmid}"
-  qm status "$vmid" >/dev/null 2>&1 && die "VM ${vmid} вже існує."
-
-  # ресурси (рекомендовані для OPNsense)
-  local cores=2 mem=2048 disk=20
-  echo
-  info "Параметри OPNsense VM:"
-  echo "    VMID=${vmid} name=opnsense"
-  echo "    machine=q35 cpu=host cores=${cores} memory=${mem}MB disk=${disk}G@${diskstore}"
-  echo "    net0(WAN)=virtio@${wan_br}  net1(LAN)=virtio@${lan_br}"
-  echo "    ISO=${iso_ref}  ostype=other(FreeBSD)  onboot=ТАК (роутер)"
-  confirm "Створити VM?" || { warn "Скасовано."; return 0; }
-
-  qm create "$vmid" \
-    --name opnsense \
-    --machine q35 \
-    --cpu host \
-    --cores "$cores" --sockets 1 \
-    --memory "$mem" \
-    --ostype other \
-    --scsihw virtio-scsi-single \
-    --scsi0 "${diskstore}:${disk}" \
-    --net0 "virtio,bridge=${wan_br}" \
-    --net1 "virtio,bridge=${lan_br}" \
-    --ide2 "${iso_ref},media=cdrom" \
-    --boot "order=scsi0;ide2" \
-    --onboot 1
-  ok "OPNsense VM ${vmid} створено. Autostart УВІМКНЕНО (роутер)."
-  echo
-  info "Далі:"
-  echo "    qm start ${vmid}   → консоль у web UI → інсталяція"
-  echo "    Признач інтерфейси: WAN=vtnet0 (${wan_br}), LAN=vtnet1 (${lan_br})"
-  echo "    LAN за замовчуванням 192.168.1.1, DHCP роздає OPNsense."
-  warn "⚠ vmbr з фізичним WAN-портом = OPNsense отримає реальний інтернет-канал."
-}
-
-# ============================================================
-#  МОДУЛЬ 9: LXC з Pi-hole
-# ============================================================
-pihole_lxc(){
-  echo
-  echo "${BLD}=== LXC Pi-hole ===${RST}"
-  command -v pct >/dev/null 2>&1 || die "pct не знайдено — не хост Proxmox."
-
-  # --- шаблон Debian 12 ---
-  local tstore
-  tstore="$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1{print $1}' | grep -x local || \
-            pvesm status -content vztmpl 2>/dev/null | awk 'NR>1{print $1; exit}')"
-  [[ -n "$tstore" ]] || die "Немає storage з content=vztmpl."
-  info "pveam update…"; pveam update >/dev/null 2>&1 || true
-  local tmpl
-  tmpl="$(pveam available --section system 2>/dev/null | awk '/debian-12-standard/{print $2}' | sort -V | tail -n1)"
-  [[ -n "$tmpl" ]] || die "Не знайшов шаблон debian-12-standard."
-  if pveam list "$tstore" 2>/dev/null | grep -q "$tmpl"; then
-    ok "Шаблон вже є: $tmpl"
-  else
-    confirm "Завантажити шаблон ${tmpl}?" || { warn "Скасовано."; return 0; }
-    pveam download "$tstore" "$tmpl"
-  fi
-  local tmpl_ref="${tstore}:vztmpl/${tmpl}"
-
-  # --- storage для rootfs ---
-  local rootstore
-  rootstore="$(pvesm status -content rootdir 2>/dev/null | awk 'NR>1{print $1}' | grep -x local-lvm || \
-               pvesm status -content rootdir 2>/dev/null | awk 'NR>1{print $1; exit}')"
-  [[ -n "$rootstore" ]] || die "Немає storage з content=rootdir."
-  read -rp "Storage для rootfs [${rootstore}]: " s || true; rootstore="${s:-$rootstore}"
-
-  # --- bridge (за замовч. LAN = не-WAN) ---
-  local wan_br lan_br
-  wan_br="$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')"
-  lan_br="$(ip -br link show type bridge 2>/dev/null | awk '{print $1}' | grep -v "^${wan_br}$" | head -n1)"
-  [[ -n "$lan_br" ]] || lan_br="${wan_br:-vmbr0}"
-  echo "Наявні bridge:"; ip -br link show type bridge 2>/dev/null | awk '{print "   "$1}'
-  read -rp "Bridge для Pi-hole (LAN) [${lan_br}]: " b || true; lan_br="${b:-$lan_br}"
-
-  # --- IP: static рекомендовано для DNS ---
-  local netcfg ip4="" ip4cidr=""
-  echo "Мережа: 1) static (рекомендовано для DNS)  2) dhcp"
-  local nm; read -rp "Вибір [1]: " nm || true; nm="${nm:-1}"
-  if [[ "$nm" == "2" ]]; then
-    netcfg="name=eth0,bridge=${lan_br},ip=dhcp"
-    warn "DHCP: IP заздалегідь невідомий. Для DNS краще static/резервація."
-  else
-    local ipc gw
-    read -rp "IP/CIDR (напр. 192.168.1.2/24): " ipc
-    [[ "$ipc" =~ ^[0-9.]+/[0-9]+$ ]] || die "Невірний формат IP/CIDR."
-    read -rp "Gateway (напр. 192.168.1.1 = OPNsense LAN): " gw
-    netcfg="name=eth0,bridge=${lan_br},ip=${ipc},gw=${gw}"
-    ip4="${ipc%%/*}"; ip4cidr="$ipc"
-  fi
-
-  # --- VMID (дефолт 501) ---
-  local vmid=501
-  if pct status "$vmid" >/dev/null 2>&1 || qm status "$vmid" >/dev/null 2>&1; then
-    vmid="$(pvesh get /cluster/nextid 2>/dev/null || echo 502)"
-    warn "501 зайнятий → ${vmid}."
-  fi
-  read -rp "CTID [${vmid}]: " v || true; vmid="${v:-$vmid}"
-  { pct status "$vmid" >/dev/null 2>&1 || qm status "$vmid" >/dev/null 2>&1; } && die "ID ${vmid} вже існує."
-
-  # --- пароль web ---
-  local wpass
-  read -rsp "Пароль web-адмінки Pi-hole (Enter = без пароля): " wpass || true; echo
-
-  echo
-  info "Параметри LXC Pi-hole:"
-  echo "    CTID=${vmid} hostname=pihole  unprivileged=1"
-  echo "    cores=1 memory=512MB swap=512MB rootfs=8G@${rootstore}"
-  echo "    net=${netcfg}"
-  confirm "Створити контейнер?" || { warn "Скасовано."; return 0; }
-
-  pct create "$vmid" "$tmpl_ref" \
-    --hostname pihole \
-    --cores 1 \
-    --memory 512 --swap 512 \
-    --rootfs "${rootstore}:8" \
-    --net0 "$netcfg" \
-    --ostype debian \
-    --unprivileged 1 \
-    --features nesting=1 \
-    --onboot 1
-  ok "Контейнер ${vmid} створено."
-
-  info "Старт контейнера…"
-  pct start "$vmid"
-  sleep 5
-
-  # чекаємо мережу
-  info "Готую систему (apt + curl)…"
-  pct exec "$vmid" -- bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y curl ca-certificates >/dev/null" || \
-    warn "apt не завершився чисто — перевір мережу контейнера."
-
-  # unattended setupVars
-  info "Розгортаю Pi-hole (unattended)…"
-  pct exec "$vmid" -- bash -c "mkdir -p /etc/pihole && cat > /etc/pihole/setupVars.conf <<'EOF'
-PIHOLE_INTERFACE=eth0
-PIHOLE_DNS_1=1.1.1.1
-PIHOLE_DNS_2=1.0.0.1
-QUERY_LOGGING=true
-INSTALL_WEB_SERVER=true
-INSTALL_WEB_INTERFACE=true
-LIGHTTPD_ENABLED=true
-DNSMASQ_LISTENING=local
-IPV4_ADDRESS=${ip4cidr}
-IPV6_ADDRESS=
-BLOCKING_ENABLED=true
-EOF"
-  pct exec "$vmid" -- bash -c "curl -sSL https://install.pi-hole.net | bash /dev/stdin --unattended" || \
-    warn "Інсталятор Pi-hole завершився з помилкою — глянь: pct exec ${vmid} -- pihole -v"
-
-  # пароль (v6: setpassword, v5: -a -p)
-  if [[ -n "$wpass" ]]; then
-    # пароль — окремим аргументом (без bash -c): лапки/спецсимволи не ламають команду
-    { pct exec "$vmid" -- pihole setpassword "$wpass" 2>/dev/null || \
-      pct exec "$vmid" -- pihole -a -p "$wpass"; } || \
-      warn "Не вдалось встановити пароль — зроби вручну: pct exec ${vmid} -- pihole setpassword"
-  fi
-
-  echo
-  ok "Pi-hole готовий у CT ${vmid}."
-  local shown="${ip4:-<DHCP-IP: pct exec ${vmid} -- hostname -I>}"
-  echo "    Web:  http://${shown}/admin"
-  echo "    DNS:  ${shown}  → пропиши цей IP як DNS у OPNsense/DHCP клієнтам"
-  # if, а не `&&` — останній рядок функції: інакше з паролем модуль повертав би 1
-  if [[ -z "$wpass" ]]; then warn "Пароль не заданий. Встанови: pct exec ${vmid} -- pihole setpassword"; fi
-}
-
-# ============================================================
-#  МОДУЛЬ 10: Kiosk-дисплей (Plymouth splash + Chromium kiosk)
+#  МОДУЛЬ 7: Kiosk-дисплей (Plymouth splash + Chromium kiosk)
 #  Ставиться на ОКРЕМУ машину-дисплей (Debian/RPi), НЕ на PVE-хост.
 #  Тягне інсталятор з kiosk/ цього ж репо і запускає його від звичайного
 #  користувача (інсталятор відмовляється працювати під root).
@@ -1110,7 +755,7 @@ kiosk_display(){
 }
 
 # ============================================================
-#  МОДУЛЬ 11: Sekta APP (Debian) — kiosk-дисплей із застосунком
+#  МОДУЛЬ 8: Sekta APP (Debian) — kiosk-дисплей із застосунком
 #  Те саме, що Kiosk-дисплей (boot-splash, автовхід, UA-клавіатура, без сну),
 #  але на екрані замість Chromium — застосунок Sekta APP (збірка для Debian,
 #  лише «Інструменти»), на весь екран. Ставить/оновлює АКТУАЛЬНУ версію з
@@ -1149,7 +794,7 @@ sekta_app_kiosk(){
   fi
 
   echo
-  warn "Якщо на машині вже стоїть Chromium-kiosk (пункт 8) — його буде замінено."
+  warn "Якщо на машині вже стоїть Chromium-kiosk (пункт 7) — його буде замінено."
   [[ -n "$runas" ]] && info "Запуск від користувача: ${BLD}${runas}${RST}"
   confirm "Встановити Sekta APP kiosk зараз?" || { warn "Скасовано."; return 0; }
 
@@ -1182,14 +827,10 @@ show_menu(){
   echo "  2) GPU passthrough (Intel iGPU пріоритет)"
   echo "  3) Перевірка IOMMU-груп (чистота GPU)"
   echo "  4) USB storage (exFAT)"
-  echo "  5) LAN bridge для OPNsense"
-  echo "  6) Debian VM (актуальний ISO + створення)"
-  echo "  7) Кнопка живлення → reboot VM"
-  echo "  8) Kiosk-дисплей (Chromium + boot splash) — на машині-дисплеї"
-  echo "  9) Sekta APP (Debian) — kiosk-дисплей із застосунком"
-  echo "  ${DIM}— опційні мережеві сервіси —${RST}"
-  echo "  10) OPNsense VM (WAN + LAN) ${DIM}[опційно]${RST}"
-  echo "  11) LXC Pi-hole (DNS-фільтр) ${DIM}[опційно]${RST}"
+  echo "  5) Debian VM (актуальний ISO + створення)"
+  echo "  6) Кнопка живлення → reboot VM"
+  echo "  7) Kiosk-дисплей (Chromium + boot splash) — на машині-дисплеї"
+  echo "  8) Sekta APP (Debian) — kiosk-дисплей із застосунком"
   echo "  q) Вихід"
   [[ -e "$GPU_REBOOT_FLAG" ]] && echo "  ${YEL}* очікує REBOOT для застосування GPU passthrough${RST}"
   echo
@@ -1223,13 +864,10 @@ main(){
       2) fn=gpu_passthrough ;;
       3) fn=iommu_check ;;
       4) fn=usb_storage ;;
-      5) fn=network_bridge ;;
-      6) fn=debian_vm ;;
-      7) fn=power_button_vm ;;
-      8) fn=kiosk_display ;;
-      9) fn=sekta_app_kiosk ;;
-      10) fn=opnsense_vm ;;
-      11) fn=pihole_lxc ;;
+      5) fn=debian_vm ;;
+      6) fn=power_button_vm ;;
+      7) fn=kiosk_display ;;
+      8) fn=sekta_app_kiosk ;;
       q|Q) finish ;;
       *) warn "Невірний вибір: '$ch'"; continue ;;
     esac
