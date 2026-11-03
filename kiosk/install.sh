@@ -59,6 +59,35 @@ die()   { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] && die "Run as a normal user, not root. The script uses sudo where needed."
 command -v sudo >/dev/null 2>&1 || die "sudo not found."
+# set -u: $USER is not set in every context (cron, some su/containers)
+USER="${USER:-$(id -un)}"
+
+# Local assets only when run as a real ./install.sh from the repo checkout.
+# `curl | bash` has no script file ($0 = "bash" → dirname "."), and pve-setup
+# runs a temp copy — both must fetch from REPO_RAW, not pick up a stray
+# logo.png from the current / temp directory.
+SRC_DIR=""
+case "${BASH_SOURCE[0]:-}" in
+  install.sh|*/install.sh) SRC_DIR="$(dirname "${BASH_SOURCE[0]}")" ;;
+esac
+
+# Append params to GRUB_CMDLINE_LINUX_DEFAULT idempotently (existing params are
+# kept); one backup + update-grub, and only if something changed.
+grub_add_params() {
+  local f=/etc/default/grub p changed=""
+  [ -f "$f" ] || return 0
+  for p in "$@"; do
+    grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$f" | grep -w -- "$p" >/dev/null && continue
+    [ -n "$changed" ] || sudo cp -a "$f" "$f.bak.$(date +%s)"
+    if grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$f" >/dev/null; then
+      sudo sed -i "s/^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"/\1 $p\"/; s/^\(GRUB_CMDLINE_LINUX_DEFAULT=\"\) /\1/" "$f"
+    else
+      echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$p\"" | sudo tee -a "$f" >/dev/null
+    fi
+    changed=1
+  done
+  if [ -n "$changed" ]; then sudo update-grub; fi
+}
 
 # Every `systemctl --user` below needs a session bus. Under `sudo -u` or a
 # non-login shell (e.g. from pve-setup) it is undefined → "Failed to connect
@@ -77,7 +106,10 @@ elif [ -n "${KIOSK_URL:-}" ]; then
   # split the env value on whitespace into the URL array
   read -r -a URLS <<< "$KIOSK_URL"
 fi
-if [ -z "$APP_MODE" ] && [ "${#URLS[@]}" -eq 0 ] && [ -r /dev/tty ]; then
+# Probe that /dev/tty really opens: `[ -r /dev/tty ]` is true even with no
+# controlling terminal (ssh without -t, cron), and the `> /dev/tty` below would
+# then kill the script under set -e. No terminal → default URL.
+if [ -z "$APP_MODE" ] && [ "${#URLS[@]}" -eq 0 ] && { : < /dev/tty; } 2>/dev/null; then
   printf 'Address to open in kiosk [%s]: ' "$DEFAULT_URL" > /dev/tty
   read -r first < /dev/tty || true
   URLS+=("${first:-$DEFAULT_URL}")
@@ -151,8 +183,8 @@ sudo mkdir -p "$THEME_DIR"
 
 info "Fetching logo..."
 tmplogo="$(mktemp --suffix=.png)"
-if [ -f "$(dirname "$0")/logo.png" ]; then
-  cp "$(dirname "$0")/logo.png" "$tmplogo"
+if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/logo.png" ]; then
+  cp "$SRC_DIR/logo.png" "$tmplogo"
 else
   curl -fsSL "$REPO_RAW/logo.png" -o "$tmplogo"
 fi
@@ -162,8 +194,8 @@ rm -f "$tmplogo"
 info "Fetching progress-bar assets..."
 for asset in bar_track.png bar_fill.png; do
   tmpasset="$(mktemp --suffix=.png)"
-  if [ -f "$(dirname "$0")/$asset" ]; then
-    cp "$(dirname "$0")/$asset" "$tmpasset"
+  if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/$asset" ]; then
+    cp "$SRC_DIR/$asset" "$tmpasset"
   else
     curl -fsSL "$REPO_RAW/$asset" -o "$tmpasset"
   fi
@@ -240,10 +272,11 @@ info "Activating theme..."
 sudo plymouth-set-default-theme -R mylogo
 
 # Quiet boot via GRUB (skipped on systems without GRUB, e.g. Raspberry Pi)
+# Adds quiet + splash, keeping the params already there (the old version
+# replaced the whole line and wiped them).
 if [ -f /etc/default/grub ]; then
   info "Configuring GRUB quiet splash..."
-  sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"/' /etc/default/grub
-  sudo update-grub
+  grub_add_params quiet splash
 else
   warn "/etc/default/grub not found — skipping GRUB step (ok on Raspberry Pi)."
 fi
@@ -472,10 +505,8 @@ else
   info "System suspend/sleep disabled (masked)."
 fi
 # Kernel console blanking off (VT) via cmdline — GRUB only (no-op on RPi).
-if [ -f /etc/default/grub ] && ! grep -q 'consoleblank=0' /etc/default/grub; then
-  sudo cp -a /etc/default/grub "/etc/default/grub.bak.$(date +%s)"
-  sudo sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 consoleblank=0"/' /etc/default/grub
-  sudo update-grub
+if [ -f /etc/default/grub ]; then
+  grub_add_params consoleblank=0
   info "Console blanking disabled (consoleblank=0)."
 fi
 

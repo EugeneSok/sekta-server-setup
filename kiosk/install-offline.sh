@@ -20,6 +20,7 @@ THEME_DIR="/usr/share/plymouth/themes/mylogo"
 DEFAULT_URL="https://combat.omega"
 SERVICE="chromium-kiosk.service"
 UNIT_DIR="$HOME/.config/systemd/user"
+USER="${USER:-$(id -un)}"   # set -u: not set in every context
 UNIT_FILE="$UNIT_DIR/$SERVICE"
 # Started by the graphical session (autostart), not by graphical-session.target
 # — labwc / wayfire never activate that target. Same scheme as install.sh.
@@ -45,7 +46,8 @@ done
 # --- Ask the user which address the kiosk should open ------------------------
 URL="${KIOSK_URL:-}"
 if [ -z "$URL" ]; then
-  if [ -r /dev/tty ]; then
+  # probe that /dev/tty opens: `[ -r ]` is true even with no terminal → set -e kill
+  if { : < /dev/tty; } 2>/dev/null; then
     printf 'Address to open in kiosk [%s]: ' "$DEFAULT_URL" > /dev/tty
     read -r URL < /dev/tty || true
   fi
@@ -169,8 +171,19 @@ sudo plymouth-set-default-theme -R mylogo
 
 if [ -f /etc/default/grub ]; then
   info "Configuring GRUB quiet splash..."
-  sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"/' /etc/default/grub
-  sudo update-grub
+  # add quiet + splash, keep existing params (replacing the line wiped them)
+  grub_changed=""
+  for p in quiet splash; do
+    grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | grep -w -- "$p" >/dev/null && continue
+    [ -n "$grub_changed" ] || sudo cp -a /etc/default/grub "/etc/default/grub.bak.$(date +%s)"
+    if grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub >/dev/null; then
+      sudo sed -i "s/^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"/\1 $p\"/; s/^\(GRUB_CMDLINE_LINUX_DEFAULT=\"\) /\1/" /etc/default/grub
+    else
+      echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$p\"" | sudo tee -a /etc/default/grub >/dev/null
+    fi
+    grub_changed=1
+  done
+  if [ -n "$grub_changed" ]; then sudo update-grub; fi
 else
   warn "/etc/default/grub not found — skipping GRUB step (ok on Raspberry Pi)."
 fi
