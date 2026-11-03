@@ -56,40 +56,57 @@ detect_bootloader(){
   fi
 }
 
-# додати параметр у cmdline ядра (ідемпотентно)
+# додати параметр(и) у cmdline ядра (ідемпотентно); boot config
+# оновлюється ОДИН раз після всіх параметрів і лише якщо щось змінилось
 add_kernel_param(){
-  local param="$1" bl
+  local bl param f changed=0 backed=0
   bl="$(detect_bootloader)"
   info "Bootloader: ${BLD}${bl}${RST}"
 
   if [[ "$bl" == "systemd-boot" ]]; then
-    local f=/etc/kernel/cmdline
+    f=/etc/kernel/cmdline
     [[ -f "$f" ]] || die "Немає $f — не можу оновити cmdline."
-    if grep -qw -- "$param" "$f"; then
-      ok "Параметр '$param' вже присутній у $f"
-    else
-      cp -a "$f" "${f}.bak.$(date +%s)"
+    for param in "$@"; do
+      if grep -qw -- "$param" "$f"; then
+        ok "Параметр '$param' вже присутній у $f"
+        continue
+      fi
+      (( backed )) || { cp -a "$f" "${f}.bak.$(date +%s)"; backed=1; }
       sed -i "s|$| ${param}|" "$f"
       # прибрати можливі подвійні пробіли
       sed -i 's/  \+/ /g' "$f"
       ok "Додано '$param' у $f"
+      changed=1
+    done
+    if (( changed )); then
+      info "Оновлюю boot config (proxmox-boot-tool refresh)…"
+      proxmox-boot-tool refresh
     fi
-    info "Оновлюю boot config (proxmox-boot-tool refresh)…"
-    proxmox-boot-tool refresh
   else
-    local f=/etc/default/grub
+    f=/etc/default/grub
     [[ -f "$f" ]] || die "Немає $f."
-    if grep -q "GRUB_CMDLINE_LINUX_DEFAULT" "$f" && \
-       grep "GRUB_CMDLINE_LINUX_DEFAULT" "$f" | grep -qw -- "$param"; then
-      ok "Параметр '$param' вже присутній у $f"
-    else
-      cp -a "$f" "${f}.bak.$(date +%s)"
-      sed -i "s|\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 ${param}\"|" "$f"
-      sed -i 's/  \+/ /g' "$f"
+    for param in "$@"; do
+      if grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$f" | grep -qw -- "$param"; then
+        ok "Параметр '$param' вже присутній у $f"
+        continue
+      fi
+      (( backed )) || { cp -a "$f" "${f}.bak.$(date +%s)"; backed=1; }
+      if grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT=' "$f"; then
+        sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 ${param}\"|" "$f"
+        sed -i 's/  \+/ /g' "$f"
+      else
+        # рядка нема (закоментований/видалений) — створюємо, інакше sed мовчки нічого не міняє
+        echo "GRUB_CMDLINE_LINUX_DEFAULT=\"${param}\"" >> "$f"
+      fi
+      grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$f" | grep -qw -- "$param" \
+        || die "Не вдалось додати '$param' у $f — перевір рядок GRUB_CMDLINE_LINUX_DEFAULT вручну."
       ok "Додано '$param' у $f"
+      changed=1
+    done
+    if (( changed )); then
+      info "Оновлюю GRUB (update-grub)…"
+      update-grub
     fi
-    info "Оновлюю GRUB (update-grub)…"
-    update-grub
   fi
 }
 
@@ -166,19 +183,19 @@ gpu_passthrough(){
   [[ -z "$all_ids" ]] && all_ids="$ids"
   info "IDs для vfio-pci (весь слот): ${all_ids}"
 
-  # 1. IOMMU параметр ядра
-  add_kernel_param "$iommu_param"
+  # 1. параметри ядра — збираємо всі, boot config оновлюється один раз
+  local -a kparams=("$iommu_param")
   # pt для Intel (passthrough mode) — безпечно
-  [[ "$iommu_param" == "intel_iommu=on" ]] && add_kernel_param "iommu=pt"
+  [[ "$iommu_param" == "intel_iommu=on" ]] && kparams+=("iommu=pt")
 
   # Intel iGPU = зазвичай основний дисплей хоста. Треба звільнити
   # framebuffer, інакше host тримає карту і vfio-pci не захопить.
   if [[ "${G_IGPU[$sel]}" == "yes" && "${desc,,}" == *intel* ]]; then
     warn "Intel iGPU: додаю параметри звільнення framebuffer хоста."
-    add_kernel_param "initcall_blacklist=sysfb_init"   # kernel 5.18+ (сучасний PVE)
-    add_kernel_param "video=efifb:off"
-    add_kernel_param "video=vesafb:off"
+    kparams+=("initcall_blacklist=sysfb_init"   # kernel 5.18+ (сучасний PVE)
+              "video=efifb:off" "video=vesafb:off")
   fi
+  add_kernel_param "${kparams[@]}"
 
   # 2. vfio модулі в /etc/modules (kernel 6.2+: vfio_virqfd не потрібен)
   local modf=/etc/modules
@@ -241,7 +258,9 @@ _system_disks(){
       [[ "$t" == "disk" ]] && seen["/dev/$n"]=1
     done < <(lsblk -nso NAME,TYPE "$src" 2>/dev/null)
   fi
-  [[ ${#seen[@]} -gt 0 ]] && printf '%s\n' "${!seen[@]}"
+  # if, а не `&&`: інакше при порожньому seen функція повертає 1 і
+  # `sysdisks="$(_system_disks)"` під set -e мовчки вбиває модуль
+  if [[ ${#seen[@]} -gt 0 ]]; then printf '%s\n' "${!seen[@]}"; fi
 }
 
 usb_storage(){
@@ -279,6 +298,13 @@ usb_storage(){
   if [[ -z "$sysdisks" && -n "$rootsrc" && "$rootsrc" == "$dev"* ]]; then
     err "$dev виглядає як системний диск (корінь на ньому). Відмова."
     warn "Повертаюсь у меню."; return 0
+  fi
+
+  # обрали розділ (/dev/sda1) — працюємо з цілим диском: форматування
+  # переписує таблицю розділів, sgdisk по розділу зіпсував би його вміст
+  if [[ "$devdisk" != "$dev" ]]; then
+    warn "${dev} — це розділ. Працюю з цілим диском ${BLD}${devdisk}${RST}."
+    dev="$devdisk"
   fi
 
   echo
@@ -379,8 +405,10 @@ network_bridge(){
       local wp; wp="$(find /sys/class/net/"$wan_br"/brif -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | head -n1)"
       info "WAN uplink: ${BLD}${wan_br}${RST} (порт: ${wp:-?}) — це буде net0/WAN у OPNsense."
     else
-      wan_br="$wan_dev"
+      # VM не підключиш напряму до NIC — для net0 потрібен bridge з цим портом
+      wan_br=""
       info "WAN uplink: ${BLD}${wan_dev}${RST} (не bridge)."
+      warn "Для net0/WAN у OPNsense потрібен bridge з портом ${wan_dev} (напр. vmbr0)."
     fi
   else
     warn "Не визначив default route — WAN вкажеш вручну в OPNsense."
@@ -708,7 +736,7 @@ iommu_check(){
   echo "${BLD}=== Перевірка IOMMU-груп ===${RST}"
   if [[ ! -d /sys/kernel/iommu_groups ]] || [[ -z "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]]; then
     err "IOMMU не активний (немає /sys/kernel/iommu_groups)."
-    warn "Спочатку модуль 1 (GPU passthrough) + REBOOT, тоді перевіряй."
+    warn "Спочатку пункт 2 (GPU passthrough) + REBOOT, тоді перевіряй."
     return 0
   fi
   ok "IOMMU активний."
@@ -914,7 +942,7 @@ pihole_lxc(){
   read -rp "Bridge для Pi-hole (LAN) [${lan_br}]: " b || true; lan_br="${b:-$lan_br}"
 
   # --- IP: static рекомендовано для DNS ---
-  local netcfg ip4=""
+  local netcfg ip4="" ip4cidr=""
   echo "Мережа: 1) static (рекомендовано для DNS)  2) dhcp"
   local nm; read -rp "Вибір [1]: " nm || true; nm="${nm:-1}"
   if [[ "$nm" == "2" ]]; then
@@ -926,7 +954,7 @@ pihole_lxc(){
     [[ "$ipc" =~ ^[0-9.]+/[0-9]+$ ]] || die "Невірний формат IP/CIDR."
     read -rp "Gateway (напр. 192.168.1.1 = OPNsense LAN): " gw
     netcfg="name=eth0,bridge=${lan_br},ip=${ipc},gw=${gw}"
-    ip4="${ipc%%/*}"
+    ip4="${ipc%%/*}"; ip4cidr="$ipc"
   fi
 
   # --- VMID (дефолт 501) ---
@@ -981,7 +1009,7 @@ INSTALL_WEB_SERVER=true
 INSTALL_WEB_INTERFACE=true
 LIGHTTPD_ENABLED=true
 DNSMASQ_LISTENING=local
-IPV4_ADDRESS=${ip4:+${ip4}/24}
+IPV4_ADDRESS=${ip4cidr}
 IPV6_ADDRESS=
 BLOCKING_ENABLED=true
 EOF"
@@ -990,7 +1018,9 @@ EOF"
 
   # пароль (v6: setpassword, v5: -a -p)
   if [[ -n "$wpass" ]]; then
-    pct exec "$vmid" -- bash -c "pihole setpassword '${wpass}' 2>/dev/null || pihole -a -p '${wpass}'" || \
+    # пароль — окремим аргументом (без bash -c): лапки/спецсимволи не ламають команду
+    { pct exec "$vmid" -- pihole setpassword "$wpass" 2>/dev/null || \
+      pct exec "$vmid" -- pihole -a -p "$wpass"; } || \
       warn "Не вдалось встановити пароль — зроби вручну: pct exec ${vmid} -- pihole setpassword"
   fi
 
@@ -999,7 +1029,8 @@ EOF"
   local shown="${ip4:-<DHCP-IP: pct exec ${vmid} -- hostname -I>}"
   echo "    Web:  http://${shown}/admin"
   echo "    DNS:  ${shown}  → пропиши цей IP як DNS у OPNsense/DHCP клієнтам"
-  [[ -z "$wpass" ]] && warn "Пароль не заданий. Встанови: pct exec ${vmid} -- pihole setpassword"
+  # if, а не `&&` — останній рядок функції: інакше з паролем модуль повертав би 1
+  if [[ -z "$wpass" ]]; then warn "Пароль не заданий. Встанови: pct exec ${vmid} -- pihole setpassword"; fi
 }
 
 # ============================================================
@@ -1186,22 +1217,30 @@ main(){
     # Кожен модуль — у субшелі: `die`/`exit` всередині завершує ЛИШЕ модуль,
     # меню виживає. Зміни на диску лишаються; змінних оболонки модулі не
     # експортують (єдиний прапорець GPU_REBOOT_FLAG — у файлі).
+    local fn
     case "$ch" in
-      1) ( post_install ) ;;
-      2) ( gpu_passthrough ) ;;
-      3) ( iommu_check ) ;;
-      4) ( usb_storage ) ;;
-      5) ( network_bridge ) ;;
-      6) ( debian_vm ) ;;
-      7) ( power_button_vm ) ;;
-      8) ( kiosk_display ) ;;
-      9) ( sekta_app_kiosk ) ;;
-      10) ( opnsense_vm ) ;;
-      11) ( pihole_lxc ) ;;
+      1) fn=post_install ;;
+      2) fn=gpu_passthrough ;;
+      3) fn=iommu_check ;;
+      4) fn=usb_storage ;;
+      5) fn=network_bridge ;;
+      6) fn=debian_vm ;;
+      7) fn=power_button_vm ;;
+      8) fn=kiosk_display ;;
+      9) fn=sekta_app_kiosk ;;
+      10) fn=opnsense_vm ;;
+      11) fn=pihole_lxc ;;
       q|Q) finish ;;
       *) warn "Невірний вибір: '$ch'"; continue ;;
     esac
-    local rc=$?
+    # Ненульовий код субшелу під `set -e` вбив би й меню → errexit вимикаємо
+    # лише в батьківському shell, а всередині модуля вмикаємо явно.
+    # НЕ `( … ) || rc=$?`: контекст `||` вимикає errexit і ВСЕРЕДИНІ модуля.
+    local rc
+    set +e
+    ( set -e; "$fn" )
+    rc=$?
+    set -e
     echo
     if [[ $rc -eq 0 ]]; then
       ok "Модуль завершено. Повертаюсь у меню…"
