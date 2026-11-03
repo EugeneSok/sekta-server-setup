@@ -19,6 +19,7 @@ DEBS_DIR="$HERE/debs"
 THEME_DIR="/usr/share/plymouth/themes/mylogo"
 DEFAULT_URL="https://combat.omega"
 SERVICE="chromium-kiosk.service"
+APP_SERVICE="sekta-kiosk.service"   # Sekta APP kiosk from install.sh (KIOSK_APP=1)
 UNIT_DIR="$HOME/.config/systemd/user"
 USER="${USER:-$(id -un)}"   # set -u: not set in every context
 UNIT_FILE="$UNIT_DIR/$SERVICE"
@@ -58,8 +59,10 @@ info "Kiosk URL: $URL"
 # --- Remove any previous installation so this run is clean -------------------
 detect_existing() {
   [ -d "$THEME_DIR" ] && return 0
-  [ -f "$UNIT_FILE" ] && return 0
-  systemctl --user list-unit-files 2>/dev/null | grep "^$SERVICE" >/dev/null && return 0
+  for svc in "$SERVICE" "$APP_SERVICE"; do
+    [ -f "$UNIT_DIR/$svc" ] && return 0
+    systemctl --user list-unit-files 2>/dev/null | grep "^$svc" >/dev/null && return 0
+  done
   return 1
 }
 
@@ -68,10 +71,13 @@ if detect_existing; then
     warn "Existing install detected — REINSTALL=keep set, overwriting in place."
   else
     warn "Existing kiosk-splash install detected — removing it before reinstall."
-    if systemctl --user list-unit-files 2>/dev/null | grep "^$SERVICE" >/dev/null; then
-      systemctl --user disable --now "$SERVICE" 2>/dev/null || true
-    fi
-    rm -f "$UNIT_FILE" "$UNIT_DIR/graphical-session.target.wants/$SERVICE"
+    # both flavours: a Sekta APP kiosk from install.sh must not stay behind
+    for svc in "$SERVICE" "$APP_SERVICE"; do
+      if systemctl --user list-unit-files 2>/dev/null | grep "^$svc" >/dev/null; then
+        systemctl --user disable --now "$svc" 2>/dev/null || true
+      fi
+      rm -f "$UNIT_DIR/$svc" "$UNIT_DIR/graphical-session.target.wants/$svc"
+    done
     systemctl --user daemon-reload 2>/dev/null || true
     rm -f "$LAUNCHER" "$XDG_AUTOSTART"
     [ -f "$LABWC_AUTOSTART" ] && sed -i "/$AUTOSTART_MARK\$/d" "$LABWC_AUTOSTART"
@@ -80,15 +86,35 @@ if detect_existing; then
   fi
 fi
 
-# --- Install every bundled .deb (no network) ---------------------------------
-# dpkg -i installs in one shot; a follow-up apt-get -f handles ordering issues
-# using only the local debs (no download, since everything is already present).
-info "Installing bundled packages from $DEBS_DIR ..."
-sudo dpkg -i "$DEBS_DIR"/*.deb || {
-  warn "dpkg reported issues — resolving from local debs only..."
-  sudo apt-get install -y --no-download --fix-broken || \
-    die "Could not satisfy dependencies offline. The debs/ set is incomplete — re-run fetch-debs.sh on a clean machine matching this arch/release."
-}
+# --- Install the bundled .debs (no network) ----------------------------------
+# The bundle is the FULL closure (libc6, systemd, …). Only packages that are
+# missing here, or older than the bundled version, are installed — `dpkg -i *`
+# would silently DOWNGRADE system libraries on a machine updated after the
+# bundle was made. apt (not dpkg) orders and configures the set — `dpkg -i`
+# of the bundle leaves systemd-sysv & co. unconfigured. With every needed .deb
+# given as a file apt has nothing to download. NB: no --no-download — apt 2.6
+# then fails on local debs ("Pathname to install is not absolute").
+info "Selecting bundled packages missing or older on this machine..."
+SELECTED=()
+skipped=0
+for deb in "$DEBS_DIR"/*.deb; do
+  pkg="$(dpkg-deb -f "$deb" Package)"
+  ver="$(dpkg-deb -f "$deb" Version)"
+  arch="$(dpkg-deb -f "$deb" Architecture)"
+  q="$pkg"; [ "$arch" = all ] || q="$pkg:$arch"
+  inst="$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$q" 2>/dev/null || true)"
+  if [ "${inst%% *}" = installed ] && dpkg --compare-versions "${inst#* }" ge "$ver"; then
+    skipped=$((skipped + 1))
+    continue
+  fi
+  SELECTED+=("$deb")
+done
+info "To install: ${#SELECTED[@]}, already present (same or newer): $skipped"
+
+if [ "${#SELECTED[@]}" -gt 0 ]; then
+  sudo apt-get install -y --no-install-recommends "${SELECTED[@]}" || \
+    die "Could not install offline. The debs/ set does not match this machine — re-run fetch-debs.sh on a machine with the same arch/release."
+fi
 
 # ============================================================================
 # PART 1 — Plymouth logo splash
@@ -200,6 +226,9 @@ fi
 CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
 [ -n "$CHROMIUM_BIN" ] || die "chromium binary not found after install — the bundled debs may be incomplete."
 
+# systemd treats '%' in ExecStart as a specifier — escape it (as install.sh does)
+URL_ARG="${URL//%/%%}"
+
 info "Writing kiosk unit to $UNIT_FILE"
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_FILE" <<EOF
@@ -215,7 +244,7 @@ Type=simple
 ExecStartPre=-/usr/bin/xset s off
 ExecStartPre=-/usr/bin/xset s noblank
 ExecStartPre=-/usr/bin/xset -dpms
-ExecStart=$CHROMIUM_BIN --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble --disable-features=Translate --no-first-run --check-for-update-interval=31536000 --password-store=basic $URL
+ExecStart=$CHROMIUM_BIN --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble --disable-features=Translate --no-first-run --check-for-update-interval=31536000 --password-store=basic $URL_ARG
 Restart=on-failure
 RestartSec=3
 EOF

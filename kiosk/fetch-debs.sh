@@ -10,9 +10,11 @@
 # It downloads plymouth, chromium, x11-xserver-utils and every dependency into
 # ./debs, so install-offline.sh can later install them with no network.
 #
-# Best run on a CLEAN image of the target: apt-get download skips packages that
-# are already installed, so a machine that already has these will fetch an
-# incomplete set. If unsure, run inside a fresh container/VM of the same release.
+# apt resolves ONE consistent package set as if the target had nothing
+# installed (empty dpkg status), so the bundle is complete even when this
+# machine already has some of the packages, and never carries both branches
+# of an `A | B` dependency (systemd vs elogind, dbus-daemon vs dbus-broker) —
+# installing both of those breaks the target (libsystemd0 gets replaced).
 #
 #   ./fetch-debs.sh
 #   # then copy the whole project folder (incl. debs/) to the offline machine.
@@ -27,6 +29,13 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 command -v apt-get >/dev/null 2>&1 || die "apt-get not found — run this on Debian/Raspberry Pi OS."
 
+# root (e.g. a fresh container) has no sudo — run apt directly
+SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo"
+
+# before `apt-cache show`: on a fresh machine the index is empty
+info "Refreshing apt index..."
+$SUDO apt-get update -y
+
 # Pick the chromium package name available in this repo.
 if apt-cache show chromium >/dev/null 2>&1; then
   CHROMIUM_PKG="chromium"
@@ -39,30 +48,22 @@ info "Chromium package: $CHROMIUM_PKG"
 
 PKGS=(plymouth plymouth-themes "$CHROMIUM_PKG" x11-xserver-utils)
 
-info "Refreshing apt index..."
-sudo apt-get update -y
+# Old bundle out: a stale mix of versions/alternatives must not reach the target.
+mkdir -p "$OUT/partial"
+rm -f "$OUT"/*.deb
 
-mkdir -p "$OUT"
-
-# Resolve the full dependency closure, then download every package into ./debs.
-# apt-cache depends --recurse over-lists (virtual/alternatives); we filter to
-# real, downloadable package names.
-info "Resolving dependency closure..."
-mapfile -t RESOLVED < <(
-  apt-cache depends --recurse --no-recommends --no-suggests \
-    --no-conflicts --no-breaks --no-replaces --no-enhances \
-    "${PKGS[@]}" 2>/dev/null \
-  | grep -v '[<>]' \
-  | grep -v '^ ' \
-  | sort -u
-)
-
-[ "${#RESOLVED[@]}" -gt 0 ] || die "Dependency resolution returned nothing."
-info "Packages to download: ${#RESOLVED[@]}"
-
-info "Downloading into $OUT ..."
-( cd "$OUT" && apt-get download "${RESOLVED[@]}" ) || \
-  warn "Some packages failed to download (virtual/already-newest?). Check output above."
+# NB: not `apt-cache depends --recurse` — it lists every alternative of
+# `A | B` (both systemd and elogind…); dpkg -i of such a set broke the target.
+info "Resolving and downloading the full dependency set into $OUT ..."
+STATUS="$(mktemp)"   # empty dpkg status = "nothing installed" → full closure
+$SUDO apt-get -q \
+  -o Dir::State::status="$STATUS" \
+  -o Dir::Cache::archives="$OUT" \
+  install -y --download-only --no-install-recommends "${PKGS[@]}" \
+  || { rm -f "$STATUS"; die "apt could not resolve/download the package set."; }
+rm -f "$STATUS"
+rm -rf "$OUT/partial" "$OUT/lock"
+[ -z "$SUDO" ] || $SUDO chown -R "$(id -u):$(id -g)" "$OUT"
 
 COUNT="$(find "$OUT" -name '*.deb' | wc -l | tr -d ' ')"
 info "Done. $COUNT .deb files in $OUT"
