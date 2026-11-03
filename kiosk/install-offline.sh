@@ -46,6 +46,18 @@ for asset in logo.png bar_track.png bar_fill.png; do
   [ -f "$HERE/$asset" ] || die "Missing local asset: $asset (offline install needs it bundled)."
 done
 
+# The bundle must match this system (written by fetch-debs.sh): debs from
+# another release would partially upgrade/mix the system, another arch can't
+# install at all. No manifest = bundle from an older fetch-debs.sh that also
+# carried conflicting alternatives (systemd + elogind) — never install that.
+[ -f "$DEBS_DIR/BUNDLE" ] || \
+  die "debs/ has no BUNDLE manifest — it was made by an older fetch-debs.sh and may break this system. Re-run ./fetch-debs.sh."
+bundle_want="$(cat "$DEBS_DIR/BUNDLE")"
+bundle_have="$( . /etc/os-release; printf 'ID=%s\nVERSION_CODENAME=%s\nARCH=%s\n' \
+  "${ID:-}" "${VERSION_CODENAME:-}" "$(dpkg --print-architecture)" )"
+[ "$bundle_want" = "$bundle_have" ] || \
+  die "debs/ is for [$(echo $bundle_want)], this machine is [$(echo $bundle_have)]. Run ./fetch-debs.sh on a machine of the same release/arch."
+
 # Append params to GRUB_CMDLINE_LINUX_DEFAULT idempotently (existing params are
 # kept); one backup + update-grub, and only if something changed. Same as install.sh.
 grub_add_params() {

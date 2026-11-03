@@ -1,2 +1,4 @@
 CLAUDE.md
 .DS_Store
+# пакети офлайн-набору (kiosk/fetch-debs.sh) — сотні МБ, генеруються
+kiosk/debs/

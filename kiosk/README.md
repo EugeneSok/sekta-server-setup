@@ -66,7 +66,10 @@ KIOSK_URL="https://a.omega https://b.omega" ./install-offline.sh
 ```
 
 Only packages missing on the target (or older than in `debs/`) are installed —
-newer system packages are never downgraded.
+newer system packages are never downgraded. `fetch-debs.sh` writes
+`debs/BUNDLE` (distro, release, arch); `install-offline.sh` refuses a bundle
+made for another release or architecture, and one without `BUNDLE` (made by an
+older `fetch-debs.sh` — re-run it), before changing anything.
 
 ## Reboot
 

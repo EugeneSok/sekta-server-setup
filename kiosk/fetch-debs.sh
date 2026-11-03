@@ -35,7 +35,11 @@ SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo"
 
 # before `apt-cache show`: on a fresh machine the index is empty
 info "Refreshing apt index..."
-$SUDO apt-get update -y
+# --error-on=any: without network `apt-get update` only warns and exits 0 — the
+# script then died with a misleading "No chromium package" (empty index) or
+# carried on with a stale one.
+$SUDO apt-get update -y --error-on=any \
+  || die "apt index update failed — no network or a repo is unreachable."
 
 # Pick the chromium package name available in this repo.
 if apt-cache show chromium >/dev/null 2>&1; then
@@ -52,7 +56,7 @@ PKGS=(plymouth plymouth-themes "$CHROMIUM_PKG" x11-xserver-utils keyboard-config
 
 # Old bundle out: a stale mix of versions/alternatives must not reach the target.
 mkdir -p "$OUT/partial"
-rm -f "$OUT"/*.deb
+rm -f "$OUT"/*.deb "$OUT/BUNDLE"
 
 # NB: not `apt-cache depends --recurse` — it lists every alternative of
 # `A | B` (both systemd and elogind…); dpkg -i of such a set broke the target.
@@ -66,6 +70,13 @@ $SUDO apt-get -q \
 rm -f "$STATUS"
 rm -rf "$OUT/partial" "$OUT/lock"
 [ -z "$SUDO" ] || $SUDO chown -R "$(id -u):$(id -g)" "$OUT"
+
+# Manifest: install-offline.sh refuses a bundle made for another distro /
+# release / arch — mixing releases would partially upgrade or break the target.
+bundle_id() { ( . /etc/os-release; printf 'ID=%s\nVERSION_CODENAME=%s\nARCH=%s\n' \
+  "${ID:-}" "${VERSION_CODENAME:-}" "$(dpkg --print-architecture)" ); }
+bundle_id > "$OUT/BUNDLE"
+info "Bundle for: $(tr '\n' ' ' < "$OUT/BUNDLE")"
 
 COUNT="$(find "$OUT" -name '*.deb' | wc -l | tr -d ' ')"
 info "Done. $COUNT .deb files in $OUT"
