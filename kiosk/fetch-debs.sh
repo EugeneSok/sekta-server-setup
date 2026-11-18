@@ -8,8 +8,10 @@
 #   - release        (bookworm, bullseye, ...)
 #
 # It downloads plymouth, chromium, x11-xserver-utils, keyboard-configuration,
-# console-setup and every dependency into
-# ./debs, so install-offline.sh can later install them with no network.
+# console-setup, wmctrl, zenity (the sekta-kiosk app) and every dependency into
+# ./debs/<release>-<arch>/ (e.g. debs/bookworm-amd64), so install-offline.sh can
+# later install them with no network. Run it on one machine per release/arch
+# to carry several bundles on one stick — the installer picks its own.
 #
 # apt resolves ONE consistent package set as if the target had nothing
 # installed (empty dpkg status), so the bundle is complete even when this
@@ -22,7 +24,8 @@
 #
 set -euo pipefail
 
-OUT="$(cd "$(dirname "$0")" && pwd)/debs"
+# one bundle per release + arch: debs/bookworm-amd64, debs/trixie-arm64, …
+OUT="$(cd "$(dirname "$0")" && pwd)/debs/$( . /etc/os-release; echo "${VERSION_CODENAME:-unknown}")-$(dpkg --print-architecture)"
 
 info() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -53,6 +56,14 @@ info "Chromium package: $CHROMIUM_PKG"
 
 # keyboard-configuration / console-setup: UA layout (PART 3a of install-offline.sh)
 PKGS=(plymouth plymouth-themes "$CHROMIUM_PKG" x11-xserver-utils keyboard-configuration console-setup)
+# multi-screen kiosk (kiosk-screens.sh): wmctrl — windows of one Chromium on
+# their screens (X11); wlr-randr — screen layout on labwc/wayfire
+PKGS+=(wmctrl)
+# sekta-kiosk app: zenity windows, pkexec to switch GDM Wayland/Xorg
+for p in zenity pkexec; do
+  if apt-cache show "$p" >/dev/null 2>&1; then PKGS+=("$p"); fi
+done
+if apt-cache show wlr-randr >/dev/null 2>&1; then PKGS+=(wlr-randr); fi
 
 # Old bundle out: a stale mix of versions/alternatives must not reach the target.
 mkdir -p "$OUT/partial"

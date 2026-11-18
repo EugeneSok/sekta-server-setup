@@ -20,8 +20,10 @@ cd sekta-server-setup/kiosk
 ./install.sh
 ```
 
-The installer asks for the address (default `https://combat.omega`) and offers
-up to 2 more sites as tabs. Without a terminal (e.g. `ssh host '…'` without `-t`)
+The installer asks how many screens the display has (1–3). One screen: the
+address (default `https://combat.omega`) plus up to 2 more sites as tabs.
+Several screens: a site for each screen and where screens 2–3 stand (see
+[Several screens](#several-screens)). Without a terminal (e.g. `ssh host '…'` without `-t`)
 it takes the default address.
 
 ### Options (environment variables)
@@ -30,6 +32,9 @@ it takes the default address.
 |---|---|
 | `KIOSK_URL="https://a.omega"` | Skip the prompt. 1 URL → locked full screen (`--kiosk`, no tab bar). |
 | `KIOSK_URL="https://a.omega https://b.omega"` | Up to 3 space-separated URLs → tabs in a maximised window (tab strip visible, Ctrl+Tab). |
+| `KIOSK_SCREENS=2` | 2 or 3 screens, one full-screen site on each; `KIOSK_URL` then lists a site per screen (missing ones repeat screen 1). |
+| `KIOSK_LAYOUT="9 3"` | Where screens 2..N stand, as a clock hour around screen 1 (default `3`). |
+| `KIOSK_OUTPUTS="HDMI-1 HDMI-2"` | Optional: outputs for screens 1..N (default: primary first, then as `xrandr` / `wlr-randr` lists them). |
 | `KIOSK_APP=1` | Sekta APP instead of Chromium (see below). |
 | `REINSTALL=keep` | Overwrite in place instead of removing the previous install first. |
 
@@ -48,6 +53,97 @@ curl -fsSL https://raw.githubusercontent.com/EugeneSok/sekta-server-setup/main/k
 - **No sleep** — system suspend/hibernate masked; `consoleblank=0` (GRUB).
 - **Autologin** — GDM3 or LightDM; without a display manager — TTY1 autologin
   (a graphical session is still needed). SDDM is not covered.
+
+## Several screens
+
+With 2–3 screens every screen gets its own Chromium in `--kiosk` with its own
+site. Where a screen stands is a **clock hour around screen 1**:
+
+| Hour | Screen is |
+|---|---|
+| `3` | right |
+| `9` | left |
+| `12` | above |
+| `6` | below |
+| `1`–`2`, `4`–`5`, `7`–`8`, `10`–`11` | diagonal (e.g. `2` — right, half a screen higher) |
+
+Several screens at the same hour line up: `3 3` — two screens in a row to the
+right of screen 1; `9 3` — screen 1 in the middle.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/EugeneSok/sekta-server-setup/main/kiosk/install.sh \
+  | KIOSK_SCREENS=3 KIOSK_LAYOUT="9 3" KIOSK_URL="https://a.omega https://b.omega https://c.omega" bash
+```
+
+The unit then runs `~/.local/bin/sekta-kiosk-screens` (`kiosk-screens.sh`) with
+settings in `~/.config/sekta-kiosk/screens.conf` (editable; restart the unit
+after a change). On every start it waits up to a minute for the screens,
+arranges them — `xrandr` on X11, `wlr-randr` on labwc / wayfire — and opens a
+full-screen window per screen:
+
+- **X11 (GNOME included)** — one Chromium, one profile: **log in once**, it
+  counts on every screen. Windows are put on their screens with `wmctrl`.
+  GNOME on Wayland allows neither, so for several screens the installer sets
+  `WaylandEnable=false` in `/etc/gdm3/daemon.conf` (backup `*.bak.<epoch>`;
+  after a reboot GNOME runs on Xorg). Reinstalling with one screen (or the
+  Sekta APP) gives Wayland back — only if the installer was the one to turn it
+  off. Restored windows beyond the screen count are closed.
+- **Wayland without X11** (labwc / wayfire) — one Chromium per screen through
+  XWayland (`--ozone-platform=x11`); screens 2–3 have their own profiles
+  (`~/.config/sekta-kiosk/chromium-N`), log in on each separately.
+
+If a window closes, all restart. Screen 1 is the **primary** output; if the
+order is wrong, swap the cables or set `KIOSK_OUTPUTS` (names from `xrandr` /
+`wlr-randr`). Fewer screens connected than configured — the kiosk starts on
+those (waiting up to a minute on the first start after boot, 5 s on restarts).
+Connected outputs beyond the kiosk screens (e.g. a laptop panel) are moved to
+the right of the layout.
+
+```bash
+journalctl --user -u chromium-kiosk.service   # which output got which site
+```
+
+**Pages are remembered** (`RESTORE=auto` — with several screens; one screen
+always opens its sites, so an unattended dashboard comes back to it on every
+boot; `RESTORE=1` / `0` in `screens.conf` — always / never). Each screen reopens what was on it before the
+reboot / restart (`--restore-last-session`: pages, history, scroll position —
+as far as the site allows), not the configured site. With one profile the
+restored windows go to the nearest screen; a screen left without one opens its
+configured site. First start, or after a
+reset, opens the configured sites. Reinstalling resets too, so new sites apply.
+
+```bash
+~/.local/bin/sekta-kiosk-screens --reset && systemctl --user restart chromium-kiosk.service   # back to the configured sites
+```
+
+
+## Sekta kiosk app (screens and sites later)
+
+The browser kiosk installs a small app, **«Sekta kiosk — екрани»**
+(`~/.local/bin/sekta-kiosk`, zenity windows): open it from the app menu or with
+**Ctrl+Alt+K** — also over the full-screen kiosk (GNOME shortcut; the dialogs
+stay on top on X11). On labwc / wayfire (Raspberry Pi OS) there is no hotkey —
+run `sekta-kiosk` from a terminal or `DISPLAY=:0 ~/.local/bin/sekta-kiosk` over ssh.
+
+The kiosk owns the display user's Chromium: screen 1 uses the default profile,
+«Повернути задані сайти» / a reinstall forget its saved pages, and with several
+screens on X11 a Chromium opened by hand is closed when the kiosk starts — use
+a dedicated user for the display.
+
+- **Екрани й сайти** — add / remove a screen (up to 3), pick its output
+  (`авто` or a name like `HDMI-2`), where it stands (clock hour around screen 1)
+  and its site; one screen may hold several sites as tabs. «Застосувати» writes
+  `screens.conf` and restarts the kiosk; new sites reset the remembered pages.
+  Going from one screen to several switches GNOME to Xorg (`pkexec`, admin
+  password) and offers a reboot; back to one screen gives Wayland back.
+- **Визначити екрани** — every monitor shows its output name and kiosk screen
+  number, to see which cable is which.
+- **Повернути задані сайти** — forget the remembered pages.
+- **Перезапустити / Зупинити / Запустити kiosk.**
+
+The kiosk unit always runs `sekta-kiosk-screens` (one screen included), so the
+app only edits `screens.conf` (`sekta-kiosk-screens --write-conf`). From a USB
+stick the same app is the offline installer — see [Offline install](#offline-install).
 
 ## Sekta APP kiosk (instead of Chromium)
 
@@ -85,34 +181,51 @@ systemctl --user status sekta-kiosk.service      # Sekta APP
 
 ## Offline install
 
-Same browser kiosk as `install.sh` — up to 3 sites as tabs, UA keyboard,
-no screen sleep, autologin — without network.
+Same browser kiosk as `install.sh` — up to 3 sites as tabs or 2–3 screens,
+UA keyboard, no screen sleep, autologin — without network.
 
 Gather packages once on an **online** Debian / Raspberry Pi OS machine of the
 **same release and arch** as the target (e.g. bookworm or trixie; amd64 or arm64).
 apt resolves one consistent, complete set as if the target had nothing
 installed, so the online machine does not need to be clean. Expect ~250 `.deb`,
-~240 MB in `debs/` (not committed — gitignored):
+~240 MB per bundle, in `debs/<release>-<arch>/` (e.g. `debs/bookworm-amd64`;
+not committed — gitignored):
 
 ```bash
 ./fetch-debs.sh
 ```
 
-Copy the whole `kiosk/` folder (scripts, logo/bar PNGs, `debs/`) to the offline
-machine, e.g. on a USB stick, then run it with `bash` — a stick mounted `noexec`
-gives `Permission denied` for `./install-offline.sh`:
+Run it on one machine per release/arch you need — **one stick can carry several
+bundles**; the installer picks the one for its machine (`VERSION_CODENAME` +
+`dpkg --print-architecture`). A flat `debs/` from an older `fetch-debs.sh`
+still works.
+
+Copy the whole `kiosk/` folder (scripts incl. `kiosk-screens.sh` and
+`sekta-kiosk.sh`, logo/bar PNGs, `debs/`) to the offline machine, e.g. on a USB
+stick. **In windows** (GNOME): open a terminal and run the app from the stick —
+it asks the screens and sites, then the sudo password, and installs everything:
+
+```bash
+bash /media/$USER/<stick>/kiosk/sekta-kiosk.sh
+```
+
+Or in the terminal only — run it with `bash` (a stick mounted `noexec` gives
+`Permission denied` for `./install-offline.sh`):
 
 ```bash
 bash ./install-offline.sh
 # or non-interactive, 1–3 sites:
 KIOSK_URL="https://a.omega https://b.omega" bash ./install-offline.sh
+# two screens, the second one to the right:
+KIOSK_SCREENS=2 KIOSK_LAYOUT=3 KIOSK_URL="https://a.omega https://b.omega" bash ./install-offline.sh
 ```
 
 Only packages missing on the target (or older than in `debs/`) are installed —
 newer system packages are never downgraded. `fetch-debs.sh` writes
 `debs/BUNDLE` (distro, release, arch); `install-offline.sh` refuses a bundle
 made for another release or architecture, and one without `BUNDLE` (made by an
-older `fetch-debs.sh` — re-run it), before changing anything.
+older `fetch-debs.sh` — re-run it), before changing anything. Without a bundle
+for its machine it lists the ones on the stick.
 
 ## Reboot
 

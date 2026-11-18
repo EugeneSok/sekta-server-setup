@@ -690,7 +690,8 @@ kiosk_display(){
   warn "Цей модуль — для ${BLD}машини-дисплея${RST} (Debian / Raspberry Pi OS),"
   warn "а не для PVE-хоста. Запускай його на самому дисплеї."
   info "Ставить: Plymouth boot-splash з логотипом SEKTA + Chromium у режимі"
-  info "kiosk (systemd --user unit), що відкриває заданий дашборд на весь екран."
+  info "kiosk (systemd --user unit), що відкриває заданий дашборд на весь екран"
+  info "(або на 2–3 екранах — на кожному свій сайт)."
   echo
 
   # інсталятор тягне install.sh + ассети з інтернету
@@ -699,22 +700,52 @@ kiosk_display(){
     confirm "Все одно спробувати?" || { warn "Пропущено."; return 0; }
   fi
 
-  # URL(и) дашборда, який відкриє kiosk. Можна до 3 сайтів — тоді kiosk
-  # відкриється на весь екран із вкладками й перемиканням між ними.
-  local urls=() u
-  read -rp "URL, який відкривати в kiosk [${KIOSK_DEFAULT_URL}]: " u || true
-  u="${u:-$KIOSK_DEFAULT_URL}"
-  urls+=("$u")
-
-  while (( ${#urls[@]} < 3 )); do
-    confirm "Відкрити ще один сайт (вкладку)?" || break
-    read -rp "URL сайту #$(( ${#urls[@]} + 1 )): " u || true
-    if [[ -z "$u" ]]; then
-      warn "Порожній URL — пропущено."
-      continue
-    fi
-    urls+=("$u")
+  # Скільки екранів у дисплея. Один — як раніше (до 3 сайтів вкладками).
+  # 2–3 — на кожному екрані свій Chromium на весь екран зі своїм сайтом;
+  # де стоїть екран, задаємо годинником відносно головного (3 — праворуч).
+  local screens n
+  while :; do
+    read -rp "Скільки екранів у дисплея (1-3) [1]: " screens || screens=1
+    screens="${screens:-1}"
+    [[ "$screens" =~ ^[1-3]$ ]] && break
+    warn "Має бути 1, 2 або 3."
   done
+
+  local urls=() layout=() u hr
+  if (( screens > 1 )); then
+    info "Де стоїть екран — година на циферблаті відносно головного екрана #1:"
+    info "  3 — праворуч, 9 — ліворуч, 12 — вище, 6 — нижче; 1-2, 4-5, 7-8, 10-11 — по діагоналі."
+    info "  Кілька екранів з однією годиною стають в ряд (3 і 3 — два праворуч)."
+    for (( n = 1; n <= screens; n++ )); do
+      local def="${urls[0]:-$KIOSK_DEFAULT_URL}"
+      read -rp "URL для екрана #${n} [${def}]: " u || true
+      urls+=("${u:-$def}")
+      (( n == 1 )) && continue
+      while :; do
+        read -rp "Де екран #${n}, година відносно екрана #1 [3]: " hr || true
+        hr="${hr:-3}"
+        [[ "$hr" =~ ^([1-9]|1[0-2])$ ]] && break
+        warn "Година — число від 1 до 12."
+      done
+      layout+=("$hr")
+    done
+  else
+    # URL(и) дашборда, який відкриє kiosk. Можна до 3 сайтів — тоді kiosk
+    # відкриється на весь екран із вкладками й перемиканням між ними.
+    read -rp "URL, який відкривати в kiosk [${KIOSK_DEFAULT_URL}]: " u || true
+    u="${u:-$KIOSK_DEFAULT_URL}"
+    urls+=("$u")
+
+    while (( ${#urls[@]} < 3 )); do
+      confirm "Відкрити ще один сайт (вкладку)?" || break
+      read -rp "URL сайту #$(( ${#urls[@]} + 1 )): " u || true
+      if [[ -z "$u" ]]; then
+        warn "Порожній URL — пропущено."
+        continue
+      fi
+      urls+=("$u")
+    done
+  fi
 
   # KIOSK_URL передаємо як пробіл-розділені URL; інсталятор їх розбирає
   local url="${urls[*]}"
@@ -730,7 +761,13 @@ kiosk_display(){
   fi
 
   echo
-  if (( ${#urls[@]} > 1 )); then
+  if (( screens > 1 )); then
+    warn "Kiosk відкриє ${BLD}${screens}${RST} екрани, на кожному свій сайт:"
+    for (( n = 1; n <= screens; n++ )); do
+      if (( n == 1 )); then hr="головний"; else hr="на ${layout[$((n - 2))]} год"; fi
+      info "  екран $n (${hr}): ${BLD}${urls[$((n - 1))]}${RST}"
+    done
+  elif (( ${#urls[@]} > 1 )); then
     warn "Kiosk відкриє ${BLD}${#urls[@]}${RST} сайти у вкладках (перемикання Ctrl+Tab):"
     local i=1; for u in "${urls[@]}"; do info "  вкладка $i: ${BLD}${u}${RST}"; i=$((i+1)); done
   else
@@ -744,9 +781,9 @@ kiosk_display(){
   curl -fsSL "${KIOSK_RAW}/install.sh" -o "$tmp" || { rm -f "$tmp"; die "Не завантажив install.sh."; }
   chmod 0644 "$tmp"   # mktemp дає 600/root → цільовий користувач не прочитає
   if [[ -n "$runas" ]]; then
-    sudo -u "$runas" -H KIOSK_URL="$url" bash "$tmp"
+    sudo -u "$runas" -H KIOSK_URL="$url" KIOSK_SCREENS="$screens" KIOSK_LAYOUT="${layout[*]}" bash "$tmp"
   else
-    KIOSK_URL="$url" bash "$tmp"
+    KIOSK_URL="$url" KIOSK_SCREENS="$screens" KIOSK_LAYOUT="${layout[*]}" bash "$tmp"
   fi
   rm -f "$tmp"
   echo

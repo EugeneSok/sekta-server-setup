@@ -5,19 +5,24 @@
 # No network. Installs apt packages from ./debs (gathered by fetch-debs.sh) and
 # loads splash assets from local files only. Same result as install.sh:
 #   1) Plymouth logo splash
-#   2) Chromium kiosk via a systemd --user unit (1 URL locked, up to 3 as tabs)
+#   2) Chromium kiosk via a systemd --user unit (1 URL locked, up to 3 as tabs,
+#      or 2–3 screens with a site on each — KIOSK_SCREENS / KIOSK_LAYOUT)
 #   3) System tweaks: UA keyboard, no screen sleep, autologin
 #
 # Prep (online machine, matching arch/release):   ./fetch-debs.sh
 # Then on the offline machine:                     ./install-offline.sh
 #
 # Run as a NORMAL user (it calls sudo itself). Preset KIOSK_URL (up to 3
-# space-separated URLs) to skip the prompt.
+# space-separated URLs) to skip the prompt; KIOSK_SCREENS, KIOSK_LAYOUT and
+# KIOSK_OUTPUTS work as in install.sh.
 #
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DEBS_DIR="$HERE/debs"
+# debs/<release>-<arch>/ — one stick can carry bundles for several machines
+# (fetch-debs.sh); a flat debs/ from an older fetch-debs.sh still works.
+BUNDLE_NAME="$( . /etc/os-release; echo "${VERSION_CODENAME:-unknown}")-$(dpkg --print-architecture)"
+if [ -d "$HERE/debs/$BUNDLE_NAME" ]; then DEBS_DIR="$HERE/debs/$BUNDLE_NAME"; else DEBS_DIR="$HERE/debs"; fi
 THEME_DIR="/usr/share/plymouth/themes/mylogo"
 DEFAULT_URL="https://combat.omega"
 SERVICE="chromium-kiosk.service"
@@ -31,6 +36,10 @@ LAUNCHER="$HOME/.local/bin/sekta-kiosk-start"
 XDG_AUTOSTART="$HOME/.config/autostart/sekta-kiosk.desktop"
 LABWC_AUTOSTART="$HOME/.config/labwc/autostart"
 AUTOSTART_MARK="# sekta-kiosk"
+# Multi-screen browser kiosk (kiosk-screens.sh), as in install.sh
+SCREENS_BIN="$HOME/.local/bin/sekta-kiosk-screens"
+SCREENS_CONF="$HOME/.config/sekta-kiosk/screens.conf"
+APP_BIN="$HOME/.local/bin/sekta-kiosk"   # sekta-kiosk app, as in install.sh
 
 info()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -41,8 +50,9 @@ command -v sudo >/dev/null 2>&1 || die "sudo not found."
 
 # --- Offline prerequisites ---------------------------------------------------
 [ -d "$DEBS_DIR" ] || die "No debs/ dir. Run ./fetch-debs.sh on an online machine first."
-ls "$DEBS_DIR"/*.deb >/dev/null 2>&1 || die "debs/ is empty. Run ./fetch-debs.sh first."
-for asset in logo.png bar_track.png bar_fill.png; do
+ls "$DEBS_DIR"/*.deb >/dev/null 2>&1 || \
+  die "No bundle for this machine ($BUNDLE_NAME) in debs/ (there: $(cd "$HERE/debs" && ls -d */ 2>/dev/null | tr -d / | tr '\n' ' ')). Run ./fetch-debs.sh on a $BUNDLE_NAME machine."
+for asset in logo.png bar_track.png bar_fill.png kiosk-screens.sh sekta-kiosk.sh; do
   [ -f "$HERE/$asset" ] || die "Missing local asset: $asset (offline install needs it bundled)."
 done
 
@@ -78,28 +88,84 @@ grub_add_params() {
 
 # --- Ask the user which address(es) the kiosk should open --------------------
 # KIOSK_URL may hold up to 3 space-separated URLs. One URL → locked --kiosk;
-# more → browser tabs in a maximised window (tab strip visible). As install.sh.
+# more → browser tabs in a maximised window (tab strip visible). With
+# KIOSK_SCREENS=2|3 — one URL per screen, KIOSK_LAYOUT = clock hour of screens
+# 2..N around screen 1. As install.sh.
 URLS=()
+SCREENS="${KIOSK_SCREENS:-}"
+LAYOUT=()
+OUTPUTS=()
+read -r -a LAYOUT <<< "${KIOSK_LAYOUT:-}"
+read -r -a OUTPUTS <<< "${KIOSK_OUTPUTS:-}"
 if [ -n "${KIOSK_URL:-}" ]; then
   read -r -a URLS <<< "$KIOSK_URL"
 fi
 # probe that /dev/tty opens: `[ -r ]` is true even with no terminal → set -e kill
 if [ "${#URLS[@]}" -eq 0 ] && { : < /dev/tty; } 2>/dev/null; then
-  printf 'Address to open in kiosk [%s]: ' "$DEFAULT_URL" > /dev/tty
-  read -r first < /dev/tty || true
-  URLS+=("${first:-$DEFAULT_URL}")
-  # offer up to two more tabs
-  while [ "${#URLS[@]}" -lt 3 ]; do
-    printf 'Open another site in a tab? [y/N] ' > /dev/tty
-    read -r ans < /dev/tty || true
-    case "${ans,,}" in y|yes) ;; *) break ;; esac
-    printf 'URL for tab #%s: ' "$(( ${#URLS[@]} + 1 ))" > /dev/tty
-    read -r more < /dev/tty || true
-    [ -n "$more" ] && URLS+=("$more")
+  # ask again until valid — a typo must not run the wrong set of questions
+  while :; do
+    case "$SCREENS" in 1|2|3) break ;; esac
+    [ -n "$SCREENS" ] && printf 'Must be 1, 2 or 3.\n' > /dev/tty
+    printf 'How many screens (1-3)? [1] ' > /dev/tty
+    read -r SCREENS < /dev/tty || SCREENS=1
+    SCREENS="${SCREENS:-1}"
   done
+  if [ "$SCREENS" -gt 1 ]; then
+    preset=("${LAYOUT[@]}")   # KIOSK_LAYOUT wins over the question
+    LAYOUT=()
+    for i in $(seq 1 "$SCREENS"); do
+      def="${URLS[0]:-$DEFAULT_URL}"
+      printf 'Address for screen #%s [%s]: ' "$i" "$def" > /dev/tty
+      read -r u < /dev/tty || true
+      URLS+=("${u:-$def}")
+      [ "$i" -eq 1 ] && continue
+      hr="${preset[$((i - 2))]:-}"
+      while :; do
+        case "$hr" in [1-9]|1[0-2]) break ;; esac
+        [ -n "$hr" ] && printf 'An hour 1-12, please.\n' > /dev/tty
+        printf 'Where is screen #%s, as a clock hour around screen #1 (3 right, 9 left, 12 above, 6 below)? [3] ' "$i" > /dev/tty
+        read -r hr < /dev/tty || hr=3
+        hr="${hr:-3}"
+      done
+      LAYOUT+=("$hr")
+    done
+  else
+    printf 'Address to open in kiosk [%s]: ' "$DEFAULT_URL" > /dev/tty
+    read -r first < /dev/tty || true
+    URLS+=("${first:-$DEFAULT_URL}")
+    # offer up to two more tabs
+    while [ "${#URLS[@]}" -lt 3 ]; do
+      printf 'Open another site in a tab? [y/N] ' > /dev/tty
+      read -r ans < /dev/tty || true
+      case "${ans,,}" in y|yes) ;; *) break ;; esac
+      printf 'URL for tab #%s: ' "$(( ${#URLS[@]} + 1 ))" > /dev/tty
+      read -r more < /dev/tty || true
+      [ -n "$more" ] && URLS+=("$more")
+    done
+  fi
 fi
 [ "${#URLS[@]}" -eq 0 ] && URLS+=("$DEFAULT_URL")
-if [ "${#URLS[@]}" -gt 1 ]; then
+
+SCREENS="${SCREENS:-1}"
+case "$SCREENS" in 1|2|3) ;; *) die "KIOSK_SCREENS must be 1, 2 or 3 (got '$SCREENS')." ;; esac
+if [ "$SCREENS" -gt 1 ]; then
+  # a site per screen: missing ones repeat screen 1, extra ones are dropped
+  while [ "${#URLS[@]}" -lt "$SCREENS" ]; do URLS+=("${URLS[0]}"); done
+  URLS=("${URLS[@]:0:$SCREENS}")
+  while [ "${#LAYOUT[@]}" -lt $(( SCREENS - 1 )) ]; do LAYOUT+=(3); done
+  LAYOUT=("${LAYOUT[@]:0:$(( SCREENS - 1 ))}")
+  for hr in "${LAYOUT[@]}"; do
+    case "$hr" in [1-9]|1[0-2]) ;; *) die "Screen position must be a clock hour 1-12 (got '$hr')." ;; esac
+  done
+fi
+
+if [ "$SCREENS" -gt 1 ]; then
+  info "Kiosk on $SCREENS screens:"
+  for i in $(seq 1 "$SCREENS"); do
+    if [ "$i" -eq 1 ]; then where="main"; else where="at ${LAYOUT[$((i - 2))]} o'clock"; fi
+    info "  screen $i ($where): ${URLS[$((i - 1))]}"
+  done
+elif [ "${#URLS[@]}" -gt 1 ]; then
   info "Kiosk URLs (${#URLS[@]} tabs): ${URLS[*]}"
 else
   info "Kiosk URL: ${URLS[0]}"
@@ -128,7 +194,8 @@ if detect_existing; then
       rm -f "$UNIT_DIR/$svc" "$UNIT_DIR/graphical-session.target.wants/$svc"
     done
     systemctl --user daemon-reload 2>/dev/null || true
-    rm -f "$LAUNCHER" "$XDG_AUTOSTART"
+    if [ -x "$APP_BIN" ]; then "$APP_BIN" --unintegrate 2>/dev/null || true; fi
+    rm -f "$LAUNCHER" "$XDG_AUTOSTART" "$SCREENS_BIN" "$SCREENS_CONF" "$APP_BIN"
     [ -f "$LABWC_AUTOSTART" ] && sed -i "/$AUTOSTART_MARK\$/d" "$LABWC_AUTOSTART"
     [ -d "$THEME_DIR" ] && sudo rm -rf "$THEME_DIR"
     info "Previous install removed."
@@ -266,18 +333,33 @@ fi
 CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
 [ -n "$CHROMIUM_BIN" ] || die "chromium binary not found after install — the bundled debs may be incomplete."
 
-# Window mode: one URL → locked --kiosk (no tab bar); several → maximised window
-# with the tab strip (Ctrl+Tab), each URL a tab.
-if [ "${#URLS[@]}" -gt 1 ]; then WINDOW_FLAGS="--start-maximized"; else WINDOW_FLAGS="--kiosk"; fi
-# systemd treats '%' in ExecStart as a specifier — escape it (as install.sh does)
-URL_ARGS="${URLS[*]}"
-URL_ARGS="${URL_ARGS//%/%%}"
+command -v wmctrl >/dev/null 2>&1 || \
+  warn "wmctrl missing (not in debs/?) — several screens would each need their own login."
+
+# The unit runs sekta-kiosk-screens (screens + Chromium), the sekta-kiosk app
+# edits screens.conf later — as in install.sh.
+info "Installing kiosk launcher $SCREENS_BIN and the sekta-kiosk app"
+# a running kiosk (REINSTALL=keep) is the launcher itself: stop it, replace
+# the files (new inode) rather than rewrite them under bash's feet
+systemctl --user stop "$SERVICE" 2>/dev/null || true
+mkdir -p "$(dirname "$SCREENS_BIN")"
+install -m 755 "$HERE/kiosk-screens.sh" "$SCREENS_BIN.new" && mv -f "$SCREENS_BIN.new" "$SCREENS_BIN"
+install -m 755 "$HERE/sekta-kiosk.sh" "$APP_BIN.new" && mv -f "$APP_BIN.new" "$APP_BIN"
+KIOSK_SCREENS="$SCREENS" KIOSK_URL="${URLS[*]}" KIOSK_LAYOUT="${LAYOUT[*]}" \
+  KIOSK_OUTPUTS="${OUTPUTS[*]}" KIOSK_CHROMIUM="$CHROMIUM_BIN" \
+  "$SCREENS_BIN" --write-conf || die "Could not write $SCREENS_CONF."
+# new sites must win over pages saved by the previous install
+"$SCREENS_BIN" --reset
+# GNOME on Wayland can't arrange screens or move windows: Xorg for several
+if [ "$SCREENS" -gt 1 ]; then sudo bash "$SCREENS_BIN" --gdm x11; else sudo bash "$SCREENS_BIN" --gdm wayland; fi
+KIOSK_EXEC="$SCREENS_BIN"
+KIOSK_DESC="Browser Kiosk (user)"
 
 info "Writing kiosk unit to $UNIT_FILE"
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_FILE" <<EOF
 [Unit]
-Description=Browser Kiosk (user)
+Description=$KIOSK_DESC
 # Started by the session autostart ($LAUNCHER), not by a target.
 StartLimitIntervalSec=0
 
@@ -288,7 +370,7 @@ Type=simple
 ExecStartPre=-/usr/bin/xset s off
 ExecStartPre=-/usr/bin/xset s noblank
 ExecStartPre=-/usr/bin/xset -dpms
-ExecStart=$CHROMIUM_BIN $WINDOW_FLAGS --noerrdialogs --disable-infobars --disable-session-crashed-bubble --disable-features=Translate --no-first-run --check-for-update-interval=31536000 --password-store=basic $URL_ARGS
+ExecStart=$KIOSK_EXEC
 Restart=on-failure
 RestartSec=3
 EOF
@@ -330,6 +412,11 @@ info "Enabling user lingering (start without opening a terminal)..."
 sudo loginctl enable-linger "$USER"
 
 systemctl --user daemon-reload 2>/dev/null || true
+# sekta-kiosk app: menu entry + Ctrl+Alt+K (gsettings needs the user bus,
+# hence after lingering). Not for the Sekta APP kiosk.
+if [ -x "$APP_BIN" ] && [ "$KIOSK_EXEC" = "$SCREENS_BIN" ]; then
+  "$APP_BIN" --integrate || warn "Could not add the sekta-kiosk menu entry / Ctrl+Alt+K."
+fi
 # Earlier versions enabled the unit into graphical-session.target — drop that.
 systemctl --user disable "$SERVICE" 2>/dev/null || true
 rm -f "$UNIT_DIR/graphical-session.target.wants/$SERVICE"
