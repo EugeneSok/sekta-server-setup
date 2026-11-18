@@ -219,6 +219,13 @@ Chromium comes from the Raspberry Pi repo, not Debian's. Version — `kiosk/VERS
 raise it for a release, so displays with the old one get the update offer.
 Removing the package keeps the installed kiosk (`~/.local/bin`) and its menu entry.
 
+The bundle is used as a local apt repository: apt installs only the kiosk
+packages and upgrades a system library only when they need it — a machine on
+an older point release (e.g. Debian 13.0 not updated) keeps its packages, and
+apt never removes or downgrades anything. If a kiosk package really needs a
+newer library than the machine can take, the install stops with an error and
+changes nothing: update the machine or build the bundle for it.
+
 ## Offline install
 
 Same browser kiosk as `install.sh` — up to 3 sites as tabs or 2–3 screens,

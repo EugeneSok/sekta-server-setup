@@ -210,36 +210,47 @@ fi
 fi   # PACKAGES_ONLY
 
 # --- Install the bundled .debs (no network) ----------------------------------
-# The bundle is the FULL closure (libc6, systemd, …). Only packages that are
-# missing here, or older than the bundled version, are installed — `dpkg -i *`
-# would silently DOWNGRADE system libraries on a machine updated after the
-# bundle was made. apt (not dpkg) orders and configures the set — `dpkg -i`
-# of the bundle leaves systemd-sysv & co. unconfigured. With every needed .deb
-# given as a file apt has nothing to download. NB: no --no-download — apt 2.6
-# then fails on local debs ("Pathname to install is not absolute").
-info "Selecting bundled packages missing or older on this machine..."
-SELECTED=()
-skipped=0
+# The bundle is the FULL closure (libc6, systemd, …) of a machine with nothing
+# installed, from the release as it was when the bundle was made. apt does the
+# choosing: the bundle becomes a local repository (the only source) and apt
+# installs just the kiosk packages, upgrading a library only when they need
+# it — and then together with what depends on it exactly, or not at all.
+# Picking "every bundled .deb newer than here" by hand broke on an older
+# point release: libblkid1 2.41.5 selected, util-linux (Pre-Depends
+# libblkid1 = 2.41-5, essential, not in the bundle) left behind → apt refused.
+# apt never downgrades, so a machine updated after the bundle keeps its newer
+# packages.
+info "Preparing the bundled packages as a local apt repository..."
+REPO="$(mktemp -d)"
+mkdir -p "$REPO/lists/partial" "$REPO/cache/partial" "$REPO/parts"
 for deb in "$DEBS_DIR"/*.deb; do
-  pkg="$(dpkg-deb -f "$deb" Package)"
-  ver="$(dpkg-deb -f "$deb" Version)"
-  arch="$(dpkg-deb -f "$deb" Architecture)"
-  q="$pkg"; [ "$arch" = all ] || q="$pkg:$arch"
-  inst="$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$q" 2>/dev/null || true)"
-  if [ "${inst%% *}" = installed ] && dpkg --compare-versions "${inst#* }" ge "$ver"; then
-    skipped=$((skipped + 1))
-    continue
-  fi
-  SELECTED+=("$deb")
+  b="$(basename "$deb")"
+  ln -s "$deb" "$REPO/$b"
+  { dpkg-deb -f "$deb"
+    echo "Filename: ./$b"
+    echo "Size: $(stat -c %s "$deb")"
+    echo "SHA256: $(sha256sum "$deb" | cut -d' ' -f1)"
+    echo; } >> "$REPO/Packages"
 done
-info "To install: ${#SELECTED[@]}, already present (same or newer): $skipped"
-
-if [ "${#SELECTED[@]}" -gt 0 ]; then
-  # noninteractive: keyboard-configuration would otherwise open a debconf
-  # layout dialog mid-install (the layout itself is set in PART 3a)
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${SELECTED[@]}" || \
-    die "Could not install offline. The debs/ set does not match this machine — re-run fetch-debs.sh on a machine with the same arch/release."
+echo "deb [trusted=yes] file:$REPO ./" > "$REPO/sources.list"
+APT_LOCAL=(-o Dir::Etc::SourceList="$REPO/sources.list" -o Dir::Etc::SourceParts="$REPO/parts"
+           -o Dir::State::Lists="$REPO/lists" -o Dir::Cache::Archives="$REPO/cache"
+           -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= -o Acquire::Languages=none)
+WANT=()
+for p in plymouth plymouth-themes chromium chromium-browser x11-xserver-utils \
+         keyboard-configuration console-setup wmctrl wlr-randr zenity pkexec; do
+  if grep -x "Package: $p" "$REPO/Packages" >/dev/null; then WANT+=("$p"); fi
+done
+sudo apt-get "${APT_LOCAL[@]}" update -qq || { sudo rm -rf "$REPO"; die "Could not read the bundled packages ($DEBS_DIR)."; }
+# noninteractive: keyboard-configuration would otherwise open a debconf
+# layout dialog mid-install (the layout itself is set in PART 3a)
+# --no-remove: never trade an installed package (a desktop's) for the kiosk —
+# apt stops with an error instead
+if ! sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCAL[@]}" install -y --no-remove --no-install-recommends "${WANT[@]}"; then
+  sudo rm -rf "$REPO"
+  die "Could not install offline: the bundle ($DEBS_DIR) does not fit this machine's packages — rebuild it (fetch-debs.sh / build-deb.sh) for the same release, or update this machine first."
 fi
+sudo rm -rf "$REPO"
 if [ -n "$PACKAGES_ONLY" ]; then info "Bundled packages installed."; exit 0; fi
 
 # ============================================================================
