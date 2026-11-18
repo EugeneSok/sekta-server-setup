@@ -544,7 +544,7 @@ main_menu() {
       --text="Екранів: $N. Kiosk $st.
 Що зробити?" --column="Дія" \
       "Екрани й сайти" "Визначити екрани" "Повернути задані сайти" "Перезапустити kiosk" "$toggle" \
-      "Оновити з файлу (.deb)" ${INSTALL_SRC:+"Перевстановити kiosk ($(src_version))"})" || exit 0
+      "Оновити з файлу (.deb)" "Зібрати діагностику" ${INSTALL_SRC:+"Перевстановити kiosk ($(src_version))"})" || exit 0
     case "$c" in
       "Екрани й сайти")
         detect_outputs
@@ -557,6 +557,7 @@ main_menu() {
       "Перезапустити kiosk") ks_stop; ks_start ;;
       "Перевстановити kiosk"*) install_from_src ;;
       "Оновити з файлу (.deb)") update_from_deb ;;
+      "Зібрати діагностику") collect_diag ;;
       "Зупинити kiosk") ks_stop ;;
       "Запустити kiosk") ks_start ;;
     esac
@@ -578,6 +579,24 @@ sudo_window_dir() {
 # Pick sekta-kiosk_<ver>+<release>_<arch>.deb, install the package, then update
 # the kiosk with the app and installer that came in it (screens, sites and
 # pages stay).
+# kiosk-screens --diag into ~/ and onto every writable stick under /media/$USER
+collect_diag() {
+  local name f saved="" d
+  name="sekta-kiosk-diag-$(date +%Y%m%d-%H%M%S).txt"
+  f="$HOME/$name"
+  { "$SCREENS_BIN" --diag; echo; echo "== utility log $LOG_FILE"; cat "$LOG_FILE" 2>/dev/null; } > "$f" 2>&1 \
+    && saved="$f"
+  for d in /media/"$USER"/*/; do
+    [ -d "$d" ] && cp "$f" "$d" 2>/dev/null && saved="$saved
+${d%/}/$name"
+  done
+  sync
+  # on screen, full-size — to photograph and send
+  [ -n "$saved" ] || { err_box "Не вдалося записати файл діагностики."; return 0; }
+  z --text-info --filename="$f" --width=1600 --height=1000 \
+    --title="$TITLE — діагностика (сфотографуйте й надішліть; файл: $(echo $saved | tr '\n' ' '))" || true
+}
+
 update_from_deb() {
   local start f pkg arch ver rel cur myarch myrel extra=() t rc tmp
   start="$HOME"

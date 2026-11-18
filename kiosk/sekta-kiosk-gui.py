@@ -14,7 +14,6 @@
 #   - the offline installer (install-offline.sh next to the app / package).
 #
 #   sekta-kiosk-gui.py [--install]   from sekta-kiosk.sh (env SEKTA_KIOSK_*)
-#   sekta-kiosk-gui.py --askpass     sudo -A password window
 #
 # Works with GTK 4.8 (Debian 12) and newer: no libadwaita, no 4.10+ API.
 import math
@@ -26,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -57,6 +57,8 @@ HOURS = {3: "праворуч", 9: "ліворуч", 12: "вище", 6: "ниж�
          1: "вище, зсунутий праворуч", 11: "вище, зсунутий ліворуч",
          5: "нижче, зсунутий праворуч", 7: "нижче, зсунутий ліворуч"}
 ZOOMS = [75, 90, 100, 110, 125, 150, 175, 200]
+# −/+ in the main window: these steps (kiosk-screens.sh takes 50–300)
+ZOOM_STEPS = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300]
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 CSS = """
@@ -114,6 +116,7 @@ button.sk-zoom:checked { background: #5f6f34; color: #ffffff; }
 progressbar.sk-bar trough { background: #d3d6c4; min-height: 8px; border-radius: 4px; border: none; }
 progressbar.sk-bar progress { background: #5f6f34; min-height: 8px; border-radius: 4px; border: none; }
 textview.sk-log, textview.sk-log text { background: #e4e5d9; color: #4a4e3f; font-family: monospace; font-size: 9pt; }
+textview.sk-diag, textview.sk-diag text { background: #f7f7f0; color: #23271b; font-family: monospace; font-size: 10.5pt; }
 .sk-logbox { border: 1px solid #c7cab7; border-radius: 10px; }
 .sk-ident { background: #23271b; color: #ecede3; }
 .sk-ident-num { font-size: 96pt; font-weight: 700; color: #c3d38c; }
@@ -261,17 +264,40 @@ def clear(box):
         child = nxt
 
 
-def sudo_window_dir():
-    """A dir with sudo (= sudo -A) and its askpass — our password window; put
-    first in PATH, the sudo of scripts run there asks in a window."""
-    t = tempfile.mkdtemp()
+def sudo_dir(password):
+    """A private dir (0700) with sudo (= sudo -A) and its askpass, which hands
+    sudo the password already checked in our window — put first in PATH, every
+    sudo of the scripts run there gets it. (A password window of its own would
+    open unfocused, under ours or the kiosk — GNOME gives a new window of
+    another process no focus — and the install would wait for it unseen.)"""
+    t = tempfile.mkdtemp()   # 0700, this user only
+    pw = os.path.join(t, "pw")
+    fd = os.open(pw, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(password + "\n")
     with open(os.path.join(t, "sudo"), "w") as f:
         f.write('#!/bin/sh\nexec /usr/bin/sudo -A "$@"\n')
     with open(os.path.join(t, "askpass"), "w") as f:
-        f.write('#!/bin/sh\nexec python3 %s --askpass "$@"\n' % shlex.quote(SELF))
+        f.write('#!/bin/sh\nexec cat %s\n' % shlex.quote(pw))
     os.chmod(os.path.join(t, "sudo"), 0o755)
-    os.chmod(os.path.join(t, "askpass"), 0o755)
+    os.chmod(os.path.join(t, "askpass"), 0o700)
     return t
+
+
+def sudo_env(env, t):
+    env["PATH"] = t + ":" + env.get("PATH", "")
+    env["SUDO_ASKPASS"] = os.path.join(t, "askpass")
+    return env
+
+
+def sudo_check(password):
+    """The password works for sudo (-k: not a cached sign-in)."""
+    try:
+        p = subprocess.run(["sudo", "-S", "-k", "-p", "", "true"], input=password + "\n", text=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        return p.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 # --- settings ----------------------------------------------------------------
@@ -461,6 +487,13 @@ class App(Gtk.Application):
         self.boxes = []
         self.before_key = ""
 
+    def do_shutdown(self):
+        # a sudo dir handed over by the update and not used (install cancelled)
+        d = os.environ.get("SEKTA_KIOSK_SUDO_DIR", "")
+        if d and os.path.isdir(d) and os.stat(d).st_uid == os.getuid():
+            shutil.rmtree(d, ignore_errors=True)
+        Gtk.Application.do_shutdown(self)
+
     # --- window ---------------------------------------------------------------
     def do_activate(self):
         prov = Gtk.CssProvider()
@@ -580,7 +613,8 @@ class App(Gtk.Application):
         menu = Gio.Menu()
         items = [("identify", "Визначити екрани", self.identify),
                  ("restore", "Повернути задані сайти", self.restore_sites),
-                 ("update", "Оновити з файлу (.deb)…", self.update_from_deb)]
+                 ("update", "Оновити з файлу (.deb)…", self.update_from_deb),
+                 ("diag", "Зібрати діагностику", self.collect_diag)]
         if INSTALL_SRC:
             items.append(("reinstall", "Перевстановити kiosk (%s)" % self.src_version(), self.install_from_src))
         for name, text, cb in items:
@@ -589,6 +623,70 @@ class App(Gtk.Application):
             self.win.add_action(a)
             menu.append(text, "win." + name)
         self.menu_btn.set_menu_model(menu)
+
+    def collect_diag(self):
+        """kiosk-screens.sh --diag (+ this app's log) into ~/ and onto every
+        writable stick under /media/$USER."""
+        def work():
+            name = time.strftime("sekta-kiosk-diag-%Y%m%d-%H%M%S.txt")
+            rc, o = run([SCREENS_BIN, "--diag"])
+            text = o + "\n== utility log %s\n%s\n" % (LOG_FILE, read(LOG_FILE) or "-")
+            saved = []
+            dirs = [os.path.expanduser("~")]
+            media = os.path.join("/media", os.environ.get("USER", ""))
+            if os.path.isdir(media):
+                dirs += [os.path.join(media, d) for d in sorted(os.listdir(media))]
+            for d in dirs:
+                f = os.path.join(d, name)
+                try:
+                    with open(f, "w") as fh:
+                        fh.write(text)
+                    saved.append(f)
+                except OSError:
+                    pass
+            if len(saved) > 1:
+                run(["sync"])
+            return text, saved
+
+        def done(res):
+            text, saved = res
+            self.show_diag(text, saved)
+        self.background(work, done)
+
+    def show_diag(self, text, saved):
+        """The report on screen, full-size — to photograph and send."""
+        d = Gtk.Window(transient_for=self.win, modal=True, title=TITLE + " — діагностика")
+        d.add_css_class("sk-dialog")
+        box = vbox(10, margin=16)
+        where = ("Файл: " + ", ".join(saved)) if saved else "Файл записати не вдалося."
+        box.append(label("Сфотографуйте екран (прокрутіть, якщо не вмістилось) і надішліть розробнику. " + where,
+                         ["sk-muted"], wrap=True))
+        tv = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
+        tv.add_css_class("sk-diag")
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        tv.get_buffer().set_text(text)
+        sc = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+        sc.add_css_class("sk-logbox")
+        sc.set_child(tv)
+        box.append(sc)
+        btns = hbox(10)
+        btns.set_halign(Gtk.Align.END)
+        btns.append(button("Оновити", "sk-btn", "view-refresh-symbolic", lambda: (d.destroy(), self.collect_diag())))
+        btns.append(button("Закрити", "sk-primary", cb=d.destroy))
+        box.append(btns)
+        d.set_child(box)
+        # the size of the monitor (no window manager may honour maximize)
+        w, h = 1200, 800
+        try:
+            mons = Gdk.Display.get_default().get_monitors()
+            if mons.get_n_items():
+                g = mons.get_item(0).get_geometry()
+                w, h = int(g.width * 0.96), int(g.height * 0.92)
+        except Exception:
+            pass
+        d.set_default_size(w, h)
+        d.maximize()
+        d.present()
 
     def poll_status(self):
         """Kiosk state in the header — systemctl off the main loop."""
@@ -686,7 +784,29 @@ class App(Gtk.Application):
             v = label("", ellipsize=True)
             v.set_hexpand(True)
             v.set_selectable(False)
-            self.grid.attach(v, 1, r, 1, 1)
+            if key == "Масштаб":
+                # quick zoom of the selected screen: − value + and back to 100 %
+                row = hbox(6)
+                self.zoom_minus = button("−", "sk-btn", cb=lambda: self.zoom_step(-1))
+                self.zoom_minus.set_tooltip_text("Дрібніше — більше вміщується")
+                self.zoom_plus = button("+", "sk-btn", cb=lambda: self.zoom_step(1))
+                self.zoom_plus.set_tooltip_text("Більше — для великого чи далекого екрана")
+                self.zoom_reset = button("100 %", "sk-btn", cb=lambda: self.zoom_step(0))
+                self.zoom_reset.set_tooltip_text("Звичайний масштаб")
+                v.set_hexpand(False)
+                v.set_xalign(0.5)
+                v.set_width_chars(6)
+                v.add_css_class("sk-title")
+                row.append(self.zoom_minus)
+                row.append(v)
+                row.append(self.zoom_plus)
+                row.append(self.zoom_reset)
+                self.zoom_one = label("— (один екран)")
+                row.append(self.zoom_one)
+                self.grid.attach(row, 1, r, 1, 1)
+                k.set_valign(Gtk.Align.CENTER)
+            else:
+                self.grid.attach(v, 1, r, 1, 1)
             self.grid_vals[key] = v
         inner.append(self.grid)
         self.edit_btn = button("Змінити екран", "sk-btn", "document-edit-symbolic", lambda: self.open_editor(self.sel))
@@ -740,7 +860,14 @@ class App(Gtk.Application):
         size = sizes.get(got[self.sel] or "", "")
         self.grid_vals["Вихід"].set_label(o + (" · " + size if size else ""))
         self.grid_vals["Де стоїть"].set_label(self.where(self.sel))
-        self.grid_vals["Масштаб"].set_label("%d %%" % cur["scale"] if n > 1 else "— (один екран)")
+        z = cur["scale"]
+        self.grid_vals["Масштаб"].set_label("%d %%" % z)
+        for w in (self.zoom_minus, self.zoom_plus, self.zoom_reset, self.grid_vals["Масштаб"]):
+            w.set_visible(n > 1)
+        self.zoom_one.set_visible(n == 1)
+        self.zoom_minus.set_sensitive(z > ZOOM_STEPS[0])
+        self.zoom_plus.set_sensitive(z < ZOOM_STEPS[-1])
+        self.zoom_reset.set_sensitive(z != 100)
         self.remove_btn.set_visible(n > 1)
         self.zoom_note.set_visible(n > 1)
         self.add_btn.set_sensitive(n < 3)
@@ -756,6 +883,19 @@ class App(Gtk.Application):
         self.apply_btn.set_sensitive(install or dirty)
         self.main_title.set_label("Екрани й сайти" if install else "Розташування екранів")
         self.stage.queue_draw()
+
+    def zoom_step(self, d):
+        """−1 / +1: the next step down / up; 0: back to 100 %."""
+        sc = self.edit.screens[self.sel]
+        z = sc["scale"]
+        if d == 0:
+            z = 100
+        elif d > 0:
+            z = next((v for v in ZOOM_STEPS if v > z), z)
+        else:
+            z = next((v for v in reversed(ZOOM_STEPS) if v < z), z)
+        sc["scale"] = z
+        self.refresh()
 
     def where(self, i):
         if i == 0:
@@ -1316,6 +1456,70 @@ class App(Gtk.Application):
         d.present()
         return d
 
+    def with_sudo(self, go):
+        """go(t): t = the sudo dir — after the admin password, asked and
+        checked in our own window (empty when sudo needs none)."""
+        # handed over by the update from a .deb (exec of the new installer):
+        # the same password, not asked twice
+        d = os.environ.pop("SEKTA_KIOSK_SUDO_DIR", "")
+        if d and os.path.isfile(os.path.join(d, "askpass")) and os.stat(d).st_uid == os.getuid():
+            go(d)
+            return
+        # no password at all (NOPASSWD): -k so a sign-in sudo still remembers
+        # (e.g. an apt install in a terminal a minute ago) does not count —
+        # the scripts' own sudo would not have it and got an empty password
+        if run(["sudo", "-n", "-k", "true"])[0] == 0:
+            go(sudo_dir(""))
+            return
+        self.ask_password(go)
+
+    def ask_password(self, go, wrong=False):
+        d = Gtk.Window(transient_for=self.win, modal=True, title=TITLE + " — пароль адміністратора",
+                       resizable=False)
+        d.add_css_class("sk-dialog")
+        d.set_default_size(440, -1)
+        box = vbox(16, margin=24)
+        row = hbox(14)
+        row.append(logo(40))
+        t = vbox(4)
+        t.append(label("Пароль адміністратора", ["sk-title"]))
+        t.append(label("Ваш пароль входу (sudo, користувач %s)." % os.environ.get("USER", ""),
+                       ["sk-muted"], wrap=True))
+        row.append(t)
+        box.append(row)
+        e = Gtk.PasswordEntry(show_peek_icon=True)
+        e.add_css_class("sk-entry")
+        box.append(e)
+        err = label("Пароль не підійшов — спробуйте ще раз." if wrong else "", ["sk-err"])
+        err.set_visible(wrong)
+        box.append(err)
+        btns = hbox(10)
+        btns.set_halign(Gtk.Align.END)
+        ok_btn = button("Гаразд", "sk-primary")
+
+        def ok(*_):
+            pw = e.get_text()
+            d.destroy()
+
+            def check():
+                return sudo_check(pw)
+
+            def checked(good):
+                if good:
+                    go(sudo_dir(pw))
+                else:
+                    self.ask_password(go, wrong=True)
+            self.background(check, checked)
+        ok_btn.connect("clicked", ok)
+        e.connect("activate", ok)
+        btns.append(button("Скасувати", cb=d.destroy))
+        btns.append(ok_btn)
+        box.append(btns)
+        d.set_child(box)
+        d.set_default_widget(ok_btn)
+        d.present()
+        e.grab_focus()
+
     def info(self, text, cb=None):
         self.dialog(text, [("Гаразд", True, True)], cb and (lambda _v: cb()))
 
@@ -1452,12 +1656,19 @@ class App(Gtk.Application):
                     p = subprocess.Popen(cmd, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                          errors="replace", bufsize=1)
-                    for line in p.stdout:
-                        line = ANSI.sub("", line.rstrip("\n"))
-                        log.write(line + "\n")
-                        log.flush()
-                        GLib.idle_add(lambda ln=line: self.log_line(ln) and False)
+
+                    def reader():
+                        for line in p.stdout:
+                            line = ANSI.sub("", line.rstrip("\n"))
+                            log.write(line + "\n")
+                            log.flush()
+                            GLib.idle_add(lambda ln=line: self.log_line(ln) and False)
+                    r = threading.Thread(target=reader, daemon=True)
+                    r.start()
+                    # done when the command ends — a daemon it started may keep
+                    # the output pipe open for good
                     rc = p.wait()
+                    r.join(3)
             except OSError as e:
                 GLib.idle_add(lambda: self.log_line(str(e)) and False)
 
@@ -1556,7 +1767,7 @@ class App(Gtk.Application):
         else:
             self.in_head.set_label("Без інтернету, з пакетів на цьому носії")
             self.in_text.set_label("Далі — екрани й сайти: скільки моніторів, де вони стоять і що показують. "
-                                   "Пароль адміністратора спитає окреме вікно.")
+                                   "Пароль адміністратора утиліта спитає перед встановленням.")
         self.stack.set_visible_child_name("intro")
 
     def after_install_cancel(self):
@@ -1570,6 +1781,9 @@ class App(Gtk.Application):
         self.stack.set_visible_child_name("main")
 
     def run_install(self):
+        self.with_sudo(self.run_install_with)
+
+    def run_install_with(self, t):
         env = dict(os.environ, **self.edit.env())
         installed = self.installed()
         # same screens and sites: keep the remembered pages; an installed kiosk
@@ -1580,9 +1794,7 @@ class App(Gtk.Application):
             env["KIOSK_KEEP_PAGES"] = "1"
         if installed:
             env["REINSTALL"] = "keep"
-        t = sudo_window_dir()
-        env["PATH"] = t + ":" + env.get("PATH", "")
-        env["SUDO_ASKPASS"] = os.path.join(t, "askpass")
+        sudo_env(env, t)
         n = len(self.edit.screens)
         self.progress("Встановлення kiosk-дисплея", "Не вимикайте машину, доки не завершиться.", self.chips(),
                       ["Екрани й сайти", "Встановлення", "Перезавантаження"], "Sekta kiosk " + self.src_version())
@@ -1726,7 +1938,7 @@ class App(Gtk.Application):
         cur = out(["dpkg-query", "-W", "-f=${Version}", "sekta-kiosk"])
         self.up_extra = []
         go = "Оновити"
-        text = "Екрани, сайти, масштаб і відкриті сторінки лишаться як є. Пароль адміністратора спитає окреме вікно."
+        text = "Екрани, сайти, масштаб і відкриті сторінки лишаться як є. Пароль адміністратора утиліта спитає перед встановленням."
         if cur and run(["dpkg", "--compare-versions", ver, "eq", cur])[0] == 0:
             self.up_extra, go = ["--reinstall"], "Перевстановити"
             text = "Ця версія вже встановлена — пакет і kiosk буде встановлено ще раз. " + text
@@ -1757,11 +1969,13 @@ class App(Gtk.Application):
         self.stack.set_visible_child_name("update")
 
     def update_go(self):
+        self.with_sudo(self.update_with)
+
+    def update_with(self, t):
         f = self.up_path
         tmp = tempfile.mkdtemp()   # a copy apt's sandbox user can read (a stick is 700)
         os.chmod(tmp, 0o755)
-        t = sudo_window_dir()
-        env = dict(os.environ, PATH=t + ":" + os.environ.get("PATH", ""), SUDO_ASKPASS=os.path.join(t, "askpass"))
+        env = sudo_env(dict(os.environ), t)
         deb = os.path.join(tmp, "sekta-kiosk.deb")
         script = ('echo "Копіювання $(basename "$1")…"; cp "$1" "$2" && chmod 644 "$2" || exit 1; '
                   'echo "Встановлення пакета…"; shift 2; '
@@ -1772,76 +1986,23 @@ class App(Gtk.Application):
         self.step(1, "todo")
 
         def done(rc):
-            shutil.rmtree(t, ignore_errors=True)
             shutil.rmtree(tmp, ignore_errors=True)
             if rc != 0:
+                shutil.rmtree(t, ignore_errors=True)
                 self.step(0, "fail", "помилка")
                 self.pr_status.set_label("Пакет не встановлено — подробиці в журналі нижче.")
                 self.pr_status.add_css_class("sk-err")
                 self.pr_buttons([("Назад", True, self.show_manage)])
                 return
             self.step(0, "done", "готово")
-            # the kiosk itself: with the package's own (new) app and installer
+            # the kiosk itself: with the package's own (new) app and installer;
+            # it takes over the sudo dir (and removes it when done)
+            os.environ["SEKTA_KIOSK_SUDO_DIR"] = t
             os.execvp("bash", ["bash", os.path.join(PKG_DIR, "sekta-kiosk.sh"), "--install"])
         self.stream(["bash", "-c", script, "_", f, deb] + self.up_extra + [deb], env, None, done)
 
 
-# --- sudo -A password window -------------------------------------------------
-def askpass():
-    res = {}
-
-    class Ask(Gtk.Application):
-        def __init__(self):
-            super().__init__(application_id="ua.sekta.kiosk.askpass", flags=Gio.ApplicationFlags.NON_UNIQUE)
-
-        def do_activate(self):
-            prov = Gtk.CssProvider()
-            if hasattr(prov, "load_from_string"):
-                prov.load_from_string(CSS)
-            else:
-                prov.load_from_data(CSS.encode())
-            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
-                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-            w = Gtk.ApplicationWindow(application=self, title=TITLE + " — пароль адміністратора", resizable=False)
-            w.add_css_class("sk-dialog")
-            w.set_default_size(440, -1)
-            box = vbox(16, margin=24)
-            row = hbox(14)
-            row.append(logo(40))
-            t = vbox(4)
-            t.append(label("Пароль адміністратора", ["sk-title"]))
-            t.append(label("Потрібен для встановлення (sudo, користувач %s)." % os.environ.get("USER", ""),
-                           ["sk-muted"], wrap=True))
-            row.append(t)
-            box.append(row)
-            e = Gtk.PasswordEntry(show_peek_icon=True)
-            e.add_css_class("sk-entry")
-            box.append(e)
-            btns = hbox(10)
-            btns.set_halign(Gtk.Align.END)
-
-            def ok(*_):
-                res["pw"] = e.get_text()
-                w.destroy()
-            btns.append(button("Скасувати", cb=w.destroy))
-            btns.append(button("Гаразд", "sk-primary", cb=ok))
-            e.connect("activate", ok)
-            box.append(btns)
-            w.set_child(box)
-            w.present()
-            e.grab_focus()
-
-    GLib.set_prgname("sekta-kiosk")
-    Ask().run([sys.argv[0]])
-    if "pw" not in res:
-        sys.exit(1)
-    print(res["pw"])
-
-
 def main():
-    if "--askpass" in sys.argv[1:]:
-        askpass()
-        return
     GLib.set_prgname("sekta-kiosk")
     GLib.set_application_name(TITLE)
     app = App(sys.argv[1:])

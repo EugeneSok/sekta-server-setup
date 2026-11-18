@@ -52,12 +52,19 @@
 #       what is not given stays as in the current file. Exit 2 = bad value.
 #   sekta-kiosk-screens --outputs   connected outputs, "name WxH" per line
 #   sekta-kiosk-screens --gdm-status   no-gdm | wayland | x11 | x11-ours
+#   sekta-kiosk-screens --diag   a report for troubleshooting (stdout): system,
+#                                session, config, what the last start did
+#                                with the screens, xrandr now, journal
 #   sekta-kiosk-screens --gdm x11|wayland      (as root)
 #       GNOME on Wayland lets no program arrange screens or move windows, so
 #       several screens need GDM's Xorg session; "wayland" undoes only a change
 #       made here (marked line in /etc/gdm3/daemon.conf).
 #
 set -u
+# numbers with a dot whatever the language: awk prints "1,500000" under
+# uk_UA and xrandr / wlr-randr refuse it — the zoom was never applied
+if [ -n "${LC_ALL:-}" ]; then export LANG="$LC_ALL"; unset LC_ALL; fi
+export LC_NUMERIC=C
 
 CONF="${SEKTA_KIOSK_CONF:-$HOME/.config/sekta-kiosk/screens.conf}"
 PROFILE_DIR="$HOME/.config/sekta-kiosk"
@@ -65,6 +72,20 @@ PROFILE_DIR="$HOME/.config/sekta-kiosk"
 log() { echo "sekta-kiosk-screens: $*" >&2; }   # → journal of the unit
 # which output each kiosk screen got ("N output" lines) — for the sekta-kiosk app
 MAP_FILE="${XDG_RUNTIME_DIR:-/tmp}/sekta-kiosk-screens.map"
+# what the last start did with the screens (layout, zoom, xrandr and what the
+# desktop made of it a few seconds later) — for --diag
+DIAG_FILE="${XDG_RUNTIME_DIR:-/tmp}/sekta-kiosk-screens.diag"
+diag() { echo "$(date +%T) $*" >> "$DIAG_FILE" 2>/dev/null || true; }
+# monitors and per-output transform (= the zoom xrandr set), as X11 sees them
+xshot() {
+  xrandr --listmonitors 2>&1 | sed 's/^/  /'
+  xrandr --verbose 2>/dev/null | awk '
+    / connected/ { name = $1; geo = $3; if (geo ~ /^primary$/) geo = $4; print "  " name " " geo; t = 0; next }
+    / disconnected/ { name = ""; next }
+    name != "" && /Transform:/ { t = 1; printf "    transform %s %s %s", $2, $3, $4; next }
+    name != "" && t == 1 { printf " | %s %s %s", $1, $2, $3; t = 2; next }
+    name != "" && t == 2 { printf " | %s %s %s\n", $1, $2, $3; t = 0; next }'
+}
 # outputs whose scale the kiosk changed, "output original-scale" per line —
 # put back when a screen stops being zoomed (also by the one-screen kiosk);
 # the runtime dir is cleared on reboot, as is a scale set with xrandr
@@ -196,6 +217,36 @@ case "${1:-}" in
       *) log "--gdm x11|wayland"; exit 2 ;;
     esac
     exit $? ;;
+  --diag)
+    {
+      echo "== sekta-kiosk diagnostics $(date '+%F %T')"
+      echo "version: $(cat "$HOME/.config/sekta-kiosk/VERSION" 2>/dev/null || echo ?)" \
+        "package: $(dpkg-query -W -f='${Version}' sekta-kiosk 2>/dev/null || echo -)"
+      . /etc/os-release 2>/dev/null; echo "system: ${PRETTY_NAME:-?} $(uname -m) kernel $(uname -r)"
+      echo "user: $(id -un) session: ${XDG_SESSION_TYPE:-?} desktop: ${XDG_CURRENT_DESKTOP:-?}" \
+        "DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}"
+      v1="$(gnome-shell --version 2>/dev/null)"; v2="$("${CHROMIUM:-chromium}" --version 2>/dev/null)"
+      v3="$(wmctrl -m 2>/dev/null | head -1)"
+      echo "gnome-shell: ${v1:--}  chromium: ${v2:--}  window manager: ${v3:--}"
+      echo "gdm: $(bash "$0" --gdm-status 2>/dev/null)"
+      grep -nE 'WaylandEnable|sekta-kiosk' "$GDM_CONF" 2>/dev/null | sed 's/^/  /'
+      echo "kiosk: $(systemctl --user is-active chromium-kiosk.service 2>/dev/null)"
+      echo; echo "== $CONF"; grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null | grep -v '^CHROMIUM_FLAGS' | sed 's/^/  /'
+      echo; echo "== last start (zoom: computed -> xrandr -> what stayed)"
+      cat "$DIAG_FILE" 2>/dev/null || echo "  (no start since boot)"
+      echo; echo "== X11 now"; xshot
+      echo "outputs (name size mode basescale):"; bash "$0" --outputs 2>&1 | sed 's/^/  /'
+      echo "screen map: $(tr '\n' ';' 2>/dev/null < "$MAP_FILE")  scale mark: $(tr '\n' ';' 2>/dev/null < "$SCALE_MARK")"
+      echo; echo "== windows"; wmctrl -lGx 2>/dev/null | sed 's/^/  /'
+      echo; echo "== ~/.config/monitors.xml (GNOME display settings)"
+      if [ -f "$HOME/.config/monitors.xml" ]; then
+        grep -E '<(connector|x|y|scale|primary|width|height)>' "$HOME/.config/monitors.xml" | tr -d ' ' | paste -sd' ' | sed 's/^/  /'
+      else echo "  -"; fi
+      echo; echo "== journal (this boot, last 40)"
+      journalctl --user -u chromium-kiosk.service -b --no-pager -o short-monotonic 2>/dev/null \
+        | grep -v 'chromium\[.*\(ERROR\|WARNING\):' | tail -40
+    } 2>&1
+    exit 0 ;;
   --gdm-status)
     if [ ! -d /etc/gdm3 ]; then echo no-gdm
     elif grep -Fx "$GDM_MARK" "$GDM_CONF" >/dev/null 2>&1; then echo x11-ours
@@ -330,6 +381,12 @@ for _ in $(seq 1 "$wait_s"); do
   sleep 1
 done
 [ "${#lines[@]}" -gt 0 ] || { log "no connected outputs found"; exit 1; }
+: > "$DIAG_FILE" 2>/dev/null
+diag "start: SCREENS=$SCREENS URLS=(${URLS[*]}) LAYOUT=(${LAYOUT[*]}) OUTPUTS=(${OUTPUTS[*]}) SCALES=(${SCALES[*]}) backend=$BACKEND"
+diag "session ${XDG_SESSION_TYPE:-?} DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}"
+for l in "${lines[@]}"; do diag "output: $l"; done
+[ -f "$SCALE_MARK" ] && diag "scale mark from earlier start: $(tr '\n' ';' < "$SCALE_MARK")"
+{ echo "before:"; xshot; } >> "$DIAG_FILE" 2>/dev/null
 
 # Screens with a named output get it; "-" (or a name not connected) gets the
 # next free output as detected (primary first). Outputs left over follow.
@@ -403,6 +460,7 @@ for ((i = 0; i < SCREENS; i++)); do
     BEGIN { sc = b * z / 100; W = int(w / sc + 0.5); H = int(h / sc + 0.5)
             printf "%d %d %.6f\n", W, H, w / W }')"
   W+=("$w"); H+=("$h"); SCALE_F+=("$f")
+  diag "screen $((i + 1)): ${NAMES[$i]} ${SIZES[$i]} zoom ${z}% base $b -> desktop ${w}x${h}, scale $f"
 done
 # xrandr --scale = desktop pixels per screen pixel, cut (not rounded) so the
 # output never comes out a pixel wider than W (overlapping its neighbour)
@@ -491,13 +549,22 @@ case "$BACKEND" in
     for ((i = 0; i < ${#EXTRA[@]}; i++)); do
       args+=(--output "${EXTRA[$i]}" --mode "${MODE_OF[${EXTRA[$i]}]}" --scale 1x1 --pos "${EX[$i]}x0")
     done
-    xrandr "${args[@]}" || log "xrandr could not arrange the screens"
+    diag "xrandr ${args[*]}"
+    if xo="$(xrandr "${args[@]}" 2>&1)"; then diag "xrandr ok${xo:+: $xo}"
+    else log "xrandr could not arrange the screens: $xo"; diag "xrandr FAILED: $xo"; fi
+    { echo "right after xrandr:"; xshot; } >> "$DIAG_FILE" 2>/dev/null
+    # does the desktop (GNOME/mutter) keep it? looked at again a bit later
+    ( for t in 3 10 30; do sleep $(( t == 3 ? 3 : t == 10 ? 7 : 20 ))
+        { echo "$(date +%T) ${t}s after xrandr:"; xshot; } >> "$DIAG_FILE" 2>/dev/null; done ) </dev/null >/dev/null 2>&1 &
+    # not a kiosk window: out of the job table, `wait` / `wait -n` below skip it
+    disown "$!" 2>/dev/null || true
     for ((i = 0; i < SCREENS; i++)); do echo "${NAMES[$i]} 1"; done > "$SCALE_MARK" 2>/dev/null
     ;;
   wlr)
     for ((i = 0; i < SCREENS; i++)); do
+      diag "wlr-randr --output ${NAMES[$i]} --on --scale ${SCALE_F[$i]} --pos ${X[$i]},${Y[$i]}"
       wlr-randr --output "${NAMES[$i]}" --on --scale "${SCALE_F[$i]}" --pos "${X[$i]},${Y[$i]}" \
-        || log "wlr-randr could not place ${NAMES[$i]}"
+        || { log "wlr-randr could not place ${NAMES[$i]}"; diag "wlr-randr FAILED for ${NAMES[$i]}"; }
     done
     for ((i = 0; i < ${#EXTRA[@]}; i++)); do
       wlr-randr --output "${EXTRA[$i]}" --scale "${BASE_OF[${EXTRA[$i]}]:-1}" --pos "${EX[$i]},0" || true
@@ -506,6 +573,7 @@ case "$BACKEND" in
     for o in "${NAMES[@]}"; do echo "$o ${BASE_OF[$o]:-1}"; done > "$SCALE_MARK" 2>/dev/null
     ;;
   none)
+    diag "Wayland without wlr-randr: layout and zoom NOT applied"
     log "Wayland without wlr-randr — screen layout is left as set in display settings"
     ;;
 esac
@@ -534,6 +602,7 @@ if [ "${#mons[@]}" -gt 0 ]; then
     (( best < 0 )) && continue
     used+=("$best")
     read -r W[$i] H[$i] X[$i] Y[$i] <<< "${mons[$best]}"
+    diag "screen $((i + 1)) window target: ${W[$i]}x${H[$i]}+${X[$i]}+${Y[$i]}"
   done
 fi
 

@@ -144,7 +144,14 @@ a dedicated user for the display.
 - **Екрани й сайти** (the main window) — add / remove a screen (up to 3);
   «Змінити екран» (or a double click on it): its site, output (`авто` or a
   name like `HDMI-2`), where it stands (a click on the clock hour around
-  screen 1) and its zoom; one screen may hold several sites as tabs. «Застосувати» writes
+  screen 1) and its zoom; one screen may hold several sites as tabs. The zoom of
+  the selected screen also changes right in the main window: «−» / «+» (steps
+  50–300 %) and «100 %», applied with «Застосувати».
+- **«Зібрати діагностику»** (menu) shows on screen what the last kiosk start did
+  with the screens (computed zoom, the `xrandr` call and its answer, what stayed
+  3 / 10 / 30 s later), the config, session, GDM and the journal — to photograph;
+  also saved as `~/sekta-kiosk-diag-<time>.txt` and on every mounted stick
+  (`sekta-kiosk-screens --diag` prints the same). «Застосувати» writes
   `screens.conf` and restarts the kiosk; new sites reset the remembered pages.
   Going from one screen to several switches GNOME to Xorg (`pkexec`, admin
   password) and offers a reboot; back to one screen gives Wayland back.
@@ -213,7 +220,7 @@ Then **«Sekta kiosk»** in the app menu (or `sekta-kiosk` in a terminal):
 - **update from a file:** menu «Оновити з файлу (.deb)» → pick
   `sekta-kiosk_<ver>+<release>_<arch>.deb` on the stick (the window opens in
   `/media/<user>`) → the app checks it is sekta-kiosk for this release and
-  arch, shows installed → new version, installs it (password in a window) and updates the kiosk with the new
+  arch, shows installed → new version, installs it (the sudo password is asked once, in the utility window) and updates the kiosk with the new
   package's installer; the same version = reinstall, an older one asks first;
 - a newer package installed over it: the app offers to update the kiosk —
   screens, sites and the open pages stay; «Перевстановити kiosk» in the menu
