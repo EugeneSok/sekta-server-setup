@@ -33,6 +33,7 @@ CONF="$HOME/.config/sekta-kiosk/screens.conf"
 SERVICE="chromium-kiosk.service"
 MAP_FILE="${XDG_RUNTIME_DIR:-/tmp}/sekta-kiosk-screens.map"
 DESKTOP_FILE="$HOME/.local/share/applications/sekta-kiosk.desktop"
+ICON_FILE="$HOME/.local/share/icons/hicolor/512x512/apps/sekta-kiosk.png"
 KB_LIST_SCHEMA="org.gnome.settings-daemon.plugins.media-keys"
 KB_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sekta-kiosk/"
 KB_SCHEMA="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KB_PATH"
@@ -56,6 +57,16 @@ have_gnome_keys() {
 }
 
 integrate() {
+  # the SEKTA icon: from the installer (SEKTA_KIOSK_ICON), next to this
+  # script (stick / package) or the package's copy
+  local src icon=video-display
+  for src in "${SEKTA_KIOSK_ICON:-}" "$HERE/sekta-kiosk.png" /usr/share/sekta-kiosk/sekta-kiosk.png; do
+    [ -n "$src" ] && [ -f "$src" ] || continue
+    mkdir -p "$(dirname "$ICON_FILE")"
+    cp "$src" "$ICON_FILE"
+    break
+  done
+  [ -f "$ICON_FILE" ] && icon=sekta-kiosk
   # same desktop id as the package's entry: ours overrides it (one item in the
   # menu) and stays when the package is removed
   mkdir -p "$(dirname "$DESKTOP_FILE")"
@@ -65,7 +76,7 @@ Type=Application
 Name=Sekta kiosk — екрани
 Comment=Екрани й сайти kiosk-дисплея (Ctrl+Alt+K)
 Exec=$APP_BIN
-Icon=video-display
+Icon=$icon
 Terminal=false
 Categories=Settings;
 EOF
@@ -84,7 +95,7 @@ EOF
 }
 
 unintegrate() {
-  rm -f "$DESKTOP_FILE"
+  rm -f "$DESKTOP_FILE" "$ICON_FILE"
   have_gnome_keys || return 0
   local list
   list="$(gsettings get "$KB_LIST_SCHEMA" custom-keybindings)"
@@ -200,18 +211,18 @@ KS="$SCREENS_BIN"
 
 # --- settings: N screens, S_URL / S_HOUR / S_OUT per screen (0-based) ---------
 load_conf() {
-  SCREENS=1; URLS=("$DEFAULT_URL"); LAYOUT=(); OUTPUTS=()
+  SCREENS=1; URLS=("$DEFAULT_URL"); LAYOUT=(); OUTPUTS=(); SCALES=()
   # shellcheck source=/dev/null
   [ -f "$CONF" ] && . "$CONF"
   [ "${#URLS[@]}" -gt 0 ] || URLS=("$DEFAULT_URL")
   N="$SCREENS"
-  S_URL=(); S_HOUR=(-); S_OUT=()
+  S_URL=(); S_HOUR=(-); S_OUT=(); S_SCALE=()
   local i
   if [ "$N" -eq 1 ]; then S_URL=("${URLS[*]}"); else
     for ((i = 0; i < N; i++)); do S_URL+=("${URLS[$i]:-${URLS[0]}}"); done
   fi
   for ((i = 1; i < N; i++)); do S_HOUR+=("${LAYOUT[$((i - 1))]:-3}"); done
-  for ((i = 0; i < N; i++)); do S_OUT+=("${OUTPUTS[$i]:--}"); done
+  for ((i = 0; i < N; i++)); do S_OUT+=("${OUTPUTS[$i]:--}"); S_SCALE+=("${SCALES[$i]:-100}"); done
 }
 
 # Connected outputs (X11 names). On Wayland only XWAYLANDn is visible — then
@@ -253,6 +264,7 @@ hour_desc() {
 where_label() {
   if [ "$1" -eq 0 ]; then echo "головний"; else echo "${S_HOUR[$1]} год — $(hour_desc "${S_HOUR[$1]}")"; fi
 }
+scale_label() { if [ "$N" -eq 1 ]; then echo "—"; else echo "${S_SCALE[$1]} %"; fi; }
 out_label() { if [ "${S_OUT[$1]}" = - ]; then echo "авто"; else echo "${S_OUT[$1]}"; fi; }
 
 # --- screen editor -----------------------------------------------------------
@@ -297,6 +309,26 @@ $OUT_NOTE}" \
     [ -n "$o" ] && S_HOUR[$i]="$o"
   fi
 
+  # zoom (several screens: one Chromium profile, its Ctrl+/- zoom is per site
+  # and would change every screen — the system scales each screen instead)
+  if [ "$N" -gt 1 ]; then
+    rows=()
+    for h in 100 110 125 150 175 200 75 90; do
+      if [ "${S_SCALE[$i]}" = "$h" ]; then sel=TRUE; else sel=FALSE; fi
+      case "$h" in
+        100) k="звичайний" ;;
+        75|90) k="дрібніше — більше вміщується" ;;
+        *) k="більше — для великого чи далекого екрана" ;;
+      esac
+      rows+=("$sel" "$h" "$k")
+    done
+    o="$(z --list --radiolist --width=560 --height=420 \
+      --text="Масштаб екрана $((i + 1)), %.
+Задається для кожного екрана окремо. Ctrl+/− у браузері змінює всі екрани разом — для різних екранів масштаб ставте тут." \
+      --column="" --column="%" --column="" "${rows[@]}")" || return 0
+    [ -n "$o" ] && S_SCALE[$i]="$o"
+  fi
+
   # site
   local t="Сайт для екрана $((i + 1)):"
   [ "$N" -eq 1 ] && t="Сайт. Кілька сайтів — через пробіл, відкриються вкладками:"
@@ -312,7 +344,7 @@ add_screen() {
   read -r first rest <<< "${S_URL[0]}"
   # tabs are for one screen only — with several, each screen has one site
   S_URL[0]="$first"
-  S_URL+=("$first"); S_HOUR+=(3); S_OUT+=(-)
+  S_URL+=("$first"); S_HOUR+=(3); S_OUT+=(-); S_SCALE+=(100)
   N=$((N + 1))
   edit_screen $((N - 1))
 }
@@ -328,6 +360,7 @@ remove_screen() {
   S_URL=("${S_URL[@]:0:k}" "${S_URL[@]:k+1}")
   S_OUT=("${S_OUT[@]:0:k}" "${S_OUT[@]:k+1}")
   S_HOUR=("${S_HOUR[@]:0:k}" "${S_HOUR[@]:k+1}")
+  S_SCALE=("${S_SCALE[@]:0:k}" "${S_SCALE[@]:k+1}")
   S_HOUR[0]=-   # the (new) screen 1 is the centre, it has no hour
   N=$((N - 1))
   [ "$k" -eq 0 ] && info_box "Головним став колишній екран 2. Перевірте, де стоять інші екрани відносно нього."
@@ -339,11 +372,11 @@ edit_screens() {
   while :; do
     rows=()
     for ((i = 0; i < N; i++)); do
-      rows+=("$((i + 1))" "$(out_label "$i")" "$(where_label "$i")" "${S_URL[$i]}")
+      rows+=("$((i + 1))" "$(out_label "$i")" "$(where_label "$i")" "$(scale_label "$i")" "${S_URL[$i]}")
     done
-    choice="$(z --list --width=860 --height=340 \
-      --text="Екрани kiosk-дисплея. Виберіть екран і натисніть «Змінити» — вихід, розташування, сайт." \
-      --column="№" --column="Вихід" --column="Де стоїть" --column="Сайт" \
+    choice="$(z --list --width=940 --height=340 \
+      --text="Екрани kiosk-дисплея. Виберіть екран і натисніть «Змінити» — вихід, розташування, масштаб, сайт." \
+      --column="№" --column="Вихід" --column="Де стоїть" --column="Масштаб" --column="Сайт" \
       --ok-label="Змінити" --cancel-label="Скасувати" \
       --extra-button="Додати екран" --extra-button="Прибрати екран" --extra-button="$done_label" \
       "${rows[@]}")"
@@ -365,7 +398,8 @@ export_settings() {
   if [ "$N" -eq 1 ]; then urls=("${S_URL[0]}"); else
     for ((i = 0; i < N; i++)); do read -r w _ <<< "${S_URL[$i]}"; urls+=("$w"); done
   fi
-  export KIOSK_SCREENS="$N" KIOSK_URL="${urls[*]}" KIOSK_LAYOUT="${S_HOUR[*]:1}" KIOSK_OUTPUTS="${S_OUT[*]}"
+  export KIOSK_SCREENS="$N" KIOSK_URL="${urls[*]}" KIOSK_LAYOUT="${S_HOUR[*]:1}" KIOSK_OUTPUTS="${S_OUT[*]}" \
+    KIOSK_SCALE="${S_SCALE[*]}"
 }
 
 # --- kiosk control -----------------------------------------------------------

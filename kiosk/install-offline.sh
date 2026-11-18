@@ -14,7 +14,7 @@
 #
 # Run as a NORMAL user (it calls sudo itself). Preset KIOSK_URL (up to 3
 # space-separated URLs) to skip the prompt; KIOSK_SCREENS, KIOSK_LAYOUT and
-# KIOSK_OUTPUTS work as in install.sh.
+# KIOSK_OUTPUTS, KIOSK_SCALE work as in install.sh.
 #
 set -euo pipefail
 
@@ -59,6 +59,8 @@ ls "$DEBS_DIR"/*.deb >/dev/null 2>&1 || \
 for asset in logo.png bar_track.png bar_fill.png kiosk-screens.sh sekta-kiosk.sh; do
   [ -f "$HERE/$asset" ] || die "Missing local asset: $asset (offline install needs it bundled)."
 done
+# only the menu icon — without it the app gets a generic one
+[ -f "$HERE/sekta-kiosk.png" ] || warn "No sekta-kiosk.png — the menu entry gets a generic icon."
 
 # The bundle must match this system (written by fetch-debs.sh): debs from
 # another release would partially upgrade/mix the system, another arch can't
@@ -437,7 +439,7 @@ systemctl --user daemon-reload 2>/dev/null || true
 # sekta-kiosk app: menu entry + Ctrl+Alt+K (gsettings needs the user bus,
 # hence after lingering). Not for the Sekta APP kiosk.
 if [ -x "$APP_BIN" ] && [ "$KIOSK_EXEC" = "$SCREENS_BIN" ]; then
-  "$APP_BIN" --integrate || warn "Could not add the sekta-kiosk menu entry / Ctrl+Alt+K."
+  SEKTA_KIOSK_ICON="$HERE/sekta-kiosk.png" "$APP_BIN" --integrate || warn "Could not add the sekta-kiosk menu entry / Ctrl+Alt+K."
 fi
 # Earlier versions enabled the unit into graphical-session.target — drop that.
 systemctl --user disable "$SERVICE" 2>/dev/null || true

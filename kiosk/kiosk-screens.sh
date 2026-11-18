@@ -15,6 +15,11 @@
 #                                 6 = below; 1-2, 4-5, 7-8, 10-11 = diagonal
 #   OUTPUTS=(HDMI-1 HDMI-2)       optional: output names for screens 1..N,
 #                                 "-" = any (primary first, then as listed)
+#   SCALES=(100 150)              zoom of each screen in % (several screens):
+#                                 set by the system (xrandr --scale /
+#                                 wlr-randr --scale), not by Chromium — its
+#                                 zoom is per site and the screens share one
+#                                 profile, so Ctrl+/- would change all of them
 #   CHROMIUM=/usr/bin/chromium
 #   CHROMIUM_FLAGS=(...)
 #   RESTORE=auto                  reopen each screen's pages from last time:
@@ -42,7 +47,8 @@
 #                                 session again when it exits)
 #   sekta-kiosk-screens --write-conf
 #       write screens.conf from KIOSK_SCREENS, KIOSK_URL, KIOSK_LAYOUT,
-#       KIOSK_OUTPUTS, KIOSK_CHROMIUM, KIOSK_RESTORE (space-separated lists);
+#       KIOSK_OUTPUTS, KIOSK_SCALE, KIOSK_CHROMIUM, KIOSK_RESTORE
+#       (space-separated lists);
 #       what is not given stays as in the current file. Exit 2 = bad value.
 #   sekta-kiosk-screens --outputs   connected outputs, "name WxH" per line
 #   sekta-kiosk-screens --gdm-status   no-gdm | wayland | x11 | x11-ours
@@ -59,6 +65,10 @@ PROFILE_DIR="$HOME/.config/sekta-kiosk"
 log() { echo "sekta-kiosk-screens: $*" >&2; }   # → journal of the unit
 # which output each kiosk screen got ("N output" lines) — for the sekta-kiosk app
 MAP_FILE="${XDG_RUNTIME_DIR:-/tmp}/sekta-kiosk-screens.map"
+# outputs whose scale the kiosk changed, "output original-scale" per line —
+# put back when a screen stops being zoomed (also by the one-screen kiosk);
+# the runtime dir is cleared on reboot, as is a scale set with xrandr
+SCALE_MARK="${XDG_RUNTIME_DIR:-/tmp}/sekta-kiosk-screens.scale"
 DEFAULT_FLAGS=(--noerrdialogs --disable-infobars --disable-session-crashed-bubble
   --disable-features=Translate --no-first-run --check-for-update-interval=31536000
   --password-store=basic)
@@ -83,17 +93,21 @@ forget_sessions() {
   done
 }
 
+# a screen zoom in percent: 50–300
+zoom_ok() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; (( $1 >= 50 && $1 <= 300 )); }
+
 # shell-quoted words, nothing for an empty list
 q_words() { local a; for a in "$@"; do printf '%q ' "$a"; done; }
 
 write_conf() {
-  SCREENS=1; URLS=(); LAYOUT=(); OUTPUTS=(); CHROMIUM=""; CHROMIUM_FLAGS=(); RESTORE=auto
+  SCREENS=1; URLS=(); LAYOUT=(); OUTPUTS=(); SCALES=(); CHROMIUM=""; CHROMIUM_FLAGS=(); RESTORE=auto
   # shellcheck source=/dev/null
   [ -f "$CONF" ] && . "$CONF"
   [ -n "${KIOSK_SCREENS:-}" ] && SCREENS="$KIOSK_SCREENS"
   [ -n "${KIOSK_URL+x}" ] && read -r -a URLS <<< "$KIOSK_URL"
   [ -n "${KIOSK_LAYOUT+x}" ] && read -r -a LAYOUT <<< "$KIOSK_LAYOUT"
   [ -n "${KIOSK_OUTPUTS+x}" ] && read -r -a OUTPUTS <<< "$KIOSK_OUTPUTS"
+  [ -n "${KIOSK_SCALE+x}" ] && read -r -a SCALES <<< "$KIOSK_SCALE"
   [ -n "${KIOSK_CHROMIUM:-}" ] && CHROMIUM="$KIOSK_CHROMIUM"
   [ -n "${KIOSK_RESTORE:-}" ] && RESTORE="$KIOSK_RESTORE"
 
@@ -114,6 +128,12 @@ write_conf() {
     LAYOUT=()
   fi
   OUTPUTS=("${OUTPUTS[@]:0:$SCREENS}")
+  while [ "${#SCALES[@]}" -lt "$SCREENS" ]; do SCALES+=(100); done
+  SCALES=("${SCALES[@]:0:$SCREENS}")
+  local sc
+  for sc in "${SCALES[@]}"; do
+    zoom_ok "$sc" || { log "screen zoom must be a percent 50-300 (got '$sc')"; return 2; }
+  done
   local seen=" " o
   for o in "${OUTPUTS[@]}"; do
     [ "$o" = - ] && continue
@@ -131,6 +151,7 @@ write_conf() {
     printf 'URLS=(%s)\n' "$(q_words "${URLS[@]}")"
     printf 'LAYOUT=(%s)\n' "${LAYOUT[*]}"
     printf 'OUTPUTS=(%s)\n' "$(q_words "${OUTPUTS[@]}")"
+    printf 'SCALES=(%s)   # zoom of each screen, %%\n' "${SCALES[*]}"
     printf 'CHROMIUM=%q\n' "$CHROMIUM"
     printf 'CHROMIUM_FLAGS=(%s)\n' "$(q_words "${CHROMIUM_FLAGS[@]}")"
     echo "RESTORE=$RESTORE   # reopen pages after a reboot: auto = on several screens, 1 = always, 0 = never"
@@ -185,7 +206,7 @@ case "${1:-}" in
   *) log "unknown option $1"; exit 2 ;;
 esac
 
-SCREENS=1; URLS=(); LAYOUT=(); OUTPUTS=(); CHROMIUM=chromium; CHROMIUM_FLAGS=(); RESTORE=auto
+SCREENS=1; URLS=(); LAYOUT=(); OUTPUTS=(); SCALES=(); CHROMIUM=chromium; CHROMIUM_FLAGS=(); RESTORE=auto
 if [ "${1:-}" != --outputs ]; then
   [ -f "$CONF" ] || { log "no config $CONF"; exit 1; }
   # shellcheck source=/dev/null
@@ -200,8 +221,24 @@ fi
 # --- one screen: the plain kiosk ---------------------------------------------
 # No layout to arrange. One site → locked --kiosk; several → tabs in a
 # maximised window (tab strip visible, Ctrl+Tab).
+# Give outputs back the scale they had before the kiosk zoomed them.
+restore_scales() {
+  [ -f "$SCALE_MARK" ] || return 0
+  local o sc
+  while read -r o sc; do
+    [ -n "$o" ] || continue
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+      wlr-randr --output "$o" --scale "$sc" 2>/dev/null || true
+    else
+      xrandr --output "$o" --scale 1x1 2>/dev/null || true
+    fi
+  done < "$SCALE_MARK"
+  rm -f "$SCALE_MARK"
+}
+
 if [ "$SCREENS" -le 1 ] && [ "${1:-}" != --outputs ]; then
   rm -f "$MAP_FILE"
+  restore_scales   # was several screens with a zoom
   if [ "${#URLS[@]}" -gt 1 ]; then win=(--start-maximized); else win=(--kiosk); fi
   if [ "$RESTORE" = 1 ] && has_session "$(profile_of 1)"; then
     open=(--restore-last-session); log "restoring the pages from last time"
@@ -211,9 +248,10 @@ if [ "$SCREENS" -le 1 ] && [ "${1:-}" != --outputs ]; then
   exec "$CHROMIUM" "${win[@]}" "${CHROMIUM_FLAGS[@]}" "${open[@]}"
 fi
 
-# --- connected outputs: "name WxH [mode]" per line, screen order ---------------
-# WxH is the size on the desktop (a portrait / rotated monitor: swapped), mode
-# the one to pass to xrandr --mode.
+# --- connected outputs: "name WxH mode scale" per line, screen order --------
+# WxH is the monitor's size in its pixels (a portrait / rotated monitor:
+# swapped), mode the one to pass to xrandr --mode, scale the compositor's
+# current one (wlroots; X11: 1).
 # X11 (also XWayland): mode = current, else preferred, else the first one.
 outputs_x11() {
   xrandr --query 2>/dev/null | awk '
@@ -236,27 +274,28 @@ outputs_x11() {
       if ($0 ~ /\*/) cur = m
       if ($0 ~ /\+/) pref = m
     }
-    END { flush() }' | sort -s -k1,1n | awk '{ print $2, $3, $4 }'
+    END { flush() }' | sort -s -k1,1n | awk '{ print $2, $3, $4, 1 }'
 }
 
-# wlroots compositors (labwc, wayfire): logical size = mode / scale.
+# wlroots compositors (labwc, wayfire): the mode (rotated) and its scale — a
+# HiDPI scale set in display settings stays the base of the kiosk's zoom.
 outputs_wlr() {
   wlr-randr 2>/dev/null | awk '
     function flush() {
       if (name == "") return
       m = (cur != "" ? cur : (pref != "" ? pref : first)); if (m == "") return
       split(m, wh, "x")
-      if (rot) printf "%s %dx%d\n", name, wh[2] / scale, wh[1] / scale
-      else     printf "%s %dx%d\n", name, wh[1] / scale, wh[2] / scale
+      if (rot) printf "%s %dx%d %s %s\n", name, wh[2], wh[1], m, scale
+      else     printf "%s %dx%d %s %s\n", name, wh[1], wh[2], m, scale
     }
-    /^[^ \t]/ { flush(); name = $1; cur = pref = first = ""; scale = 1; rot = 0; next }
+    /^[^ \t]/ { flush(); name = $1; cur = pref = first = ""; rot = 0; scale = 1; next }
+    $1 == "Scale:" && $2 > 0 { scale = $2 }
     $1 == "Transform:" { rot = ($2 ~ /90|270/) }
     $1 ~ /^[0-9]+x[0-9]+$/ && $2 == "px," {
       if (first == "") first = $1
       if ($0 ~ /current/) cur = $1
       if ($0 ~ /preferred/) pref = $1
     }
-    $1 == "Scale:" && $2 > 0 { scale = $2 }
     END { flush() }'
 }
 
@@ -295,11 +334,16 @@ done
 # Screens with a named output get it; "-" (or a name not connected) gets the
 # next free output as detected (primary first). Outputs left over follow.
 # An output named twice goes to the first of those screens only.
-declare -A SIZE_OF=() MODE_OF=()
+declare -A SIZE_OF=() MODE_OF=() BASE_OF=() ORIG_OF=()
+# scales changed by an earlier start: their originals are the base, not the
+# current (zoomed) value
+if [ -f "$SCALE_MARK" ]; then
+  while read -r o sc; do [ -n "$o" ] && ORIG_OF[$o]="$sc"; done < "$SCALE_MARK"
+fi
 detected=()
 for l in "${lines[@]}"; do
-  read -r o sz md <<< "$l"
-  SIZE_OF[$o]="$sz"; MODE_OF[$o]="${md:-$sz}"; detected+=("$o")
+  read -r o sz md sc <<< "$l"
+  SIZE_OF[$o]="$sz"; MODE_OF[$o]="${md:-$sz}"; BASE_OF[$o]="${ORIG_OF[$o]:-${sc:-1}}"; detected+=("$o")
 done
 taken=" "
 for o in "${OUTPUTS[@]}"; do
@@ -328,14 +372,15 @@ for ((i = 0; i < SCREENS; i++)); do
 done
 # A screen left without a monitor is skipped; the others keep their sites and
 # hours (a skipped screen 1 → the next one becomes the centre).
-urls=(); layout=()
+urls=(); layout=(); scales=()
 for ((i = 0; i < SCREENS; i++)); do
   if [ -z "${SCREEN_OUT[$i]:-}" ]; then log "screen $((i + 1)): no monitor for it — skipped"; continue; fi
   NAMES+=("${SCREEN_OUT[$i]}")
   urls+=("${URLS[$i]:-${URLS[0]:-}}")
+  scales+=("${SCALES[$i]:-100}")
   [ "${#NAMES[@]}" -gt 1 ] && layout+=("${LAYOUT[$((i - 1))]:-3}")
 done
-URLS=("${urls[@]}"); LAYOUT=("${layout[@]}")
+URLS=("${urls[@]}"); LAYOUT=("${layout[@]}"); SCALES=("${scales[@]}")
 SCREENS="${#NAMES[@]}"
 NAMES+=("${free[@]}")   # outputs left over: moved aside below
 [ "$SCREENS" -gt 0 ] || { log "no monitor for any screen"; exit 1; }
@@ -346,7 +391,22 @@ for ((i = 0; i < SCREENS; i++)); do SIZES+=("${SIZE_OF[${NAMES[$i]}]}"); done
 # screen 1 (right: 2-4, below: 5-7, left: 8-10, above: 11-1), centred on
 # screen 1 for 3/6/9/12 and shifted by half its size for the diagonal hours.
 X=(); Y=(); W=(); H=()
-for ((i = 0; i < SCREENS; i++)); do W+=("${SIZES[$i]%x*}"); H+=("${SIZES[$i]#*x}"); done
+# Zoom Z % on top of the output's base scale b (wlroots HiDPI; X11: 1): the
+# screen shows its pixels / (b·Z/100) of the desktop. W/H are whole desktop
+# pixels; the scale handed to xrandr / wlr-randr is derived from them, so the
+# compositor gets the same size the layout was made with.
+SCALE_F=()   # final scale per screen (screen pixels per desktop pixel)
+for ((i = 0; i < SCREENS; i++)); do
+  z="${SCALES[$i]:-100}"; zoom_ok "$z" || z=100
+  b="${BASE_OF[${NAMES[$i]}]:-1}"
+  read -r w h f <<< "$(awk -v w="${SIZES[$i]%x*}" -v h="${SIZES[$i]#*x}" -v b="$b" -v z="$z" '
+    BEGIN { sc = b * z / 100; W = int(w / sc + 0.5); H = int(h / sc + 0.5)
+            printf "%d %d %.6f\n", W, H, w / W }')"
+  W+=("$w"); H+=("$h"); SCALE_F+=("$f")
+done
+# xrandr --scale = desktop pixels per screen pixel, cut (not rounded) so the
+# output never comes out a pixel wider than W (overlapping its neighbour)
+xscale() { awk -v w="$1" -v W="$2" 'BEGIN { printf "%.6f", int(W / w * 1000000) / 1000000 }'; }
 X[0]=0; Y[0]=0
 w1=${W[0]}; h1=${H[0]}
 right=$w1; left=0; top=0; bottom=$h1   # outer edges of each side so far
@@ -412,27 +472,38 @@ EXTRA=("${NAMES[@]:$SCREENS}")
 ex=0
 for ((i = 0; i < SCREENS; i++)); do (( X[i] + W[i] > ex )) && ex=$(( X[i] + W[i] )); done
 EX=()
-for o in "${EXTRA[@]}"; do EX+=("$ex"); ex=$(( ex + ${SIZE_OF[$o]%x*} )); done
+for o in "${EXTRA[@]}"; do
+  EX+=("$ex")
+  if [ "$BACKEND" = wlr ]; then
+    ex=$(( ex + $(awk -v w="${SIZE_OF[$o]%x*}" -v b="${BASE_OF[$o]:-1}" 'BEGIN { printf "%d", w / b + 0.5 }') ))
+  else
+    ex=$(( ex + ${SIZE_OF[$o]%x*} ))
+  fi
+done
 [ "${#EXTRA[@]}" -gt 0 ] && log "not kiosk screens, moved aside: ${EXTRA[*]}"
 case "$BACKEND" in
   x11)
     args=()
     for ((i = 0; i < SCREENS; i++)); do
-      args+=(--output "${NAMES[$i]}" --mode "${MODE_OF[${NAMES[$i]}]}" --pos "${X[$i]}x${Y[$i]}")
+      f="$(xscale "${SIZES[$i]%x*}" "${W[$i]}")"
+      args+=(--output "${NAMES[$i]}" --mode "${MODE_OF[${NAMES[$i]}]}" --scale "${f}x${f}" --pos "${X[$i]}x${Y[$i]}")
     done
     for ((i = 0; i < ${#EXTRA[@]}; i++)); do
-      args+=(--output "${EXTRA[$i]}" --mode "${MODE_OF[${EXTRA[$i]}]}" --pos "${EX[$i]}x0")
+      args+=(--output "${EXTRA[$i]}" --mode "${MODE_OF[${EXTRA[$i]}]}" --scale 1x1 --pos "${EX[$i]}x0")
     done
     xrandr "${args[@]}" || log "xrandr could not arrange the screens"
+    for ((i = 0; i < SCREENS; i++)); do echo "${NAMES[$i]} 1"; done > "$SCALE_MARK" 2>/dev/null
     ;;
   wlr)
     for ((i = 0; i < SCREENS; i++)); do
-      wlr-randr --output "${NAMES[$i]}" --on --pos "${X[$i]},${Y[$i]}" \
+      wlr-randr --output "${NAMES[$i]}" --on --scale "${SCALE_F[$i]}" --pos "${X[$i]},${Y[$i]}" \
         || log "wlr-randr could not place ${NAMES[$i]}"
     done
     for ((i = 0; i < ${#EXTRA[@]}; i++)); do
-      wlr-randr --output "${EXTRA[$i]}" --pos "${EX[$i]},0" || true
+      wlr-randr --output "${EXTRA[$i]}" --scale "${BASE_OF[${EXTRA[$i]}]:-1}" --pos "${EX[$i]},0" || true
     done
+    # originals of everything touched — for restore_scales and the next start
+    for o in "${NAMES[@]}"; do echo "$o ${BASE_OF[$o]:-1}"; done > "$SCALE_MARK" 2>/dev/null
     ;;
   none)
     log "Wayland without wlr-randr — screen layout is left as set in display settings"

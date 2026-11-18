@@ -32,7 +32,7 @@ info() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 FILES=(install-offline.sh kiosk-screens.sh sekta-kiosk.sh fetch-debs.sh
-       logo.png bar_track.png bar_fill.png VERSION)
+       logo.png bar_track.png bar_fill.png sekta-kiosk.png VERSION)
 
 if [ "${1:-}" != "--local" ]; then
   release="${1:-bookworm}"; arch="${2:-amd64}"
@@ -74,7 +74,8 @@ fi
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
 share="$root/usr/share/sekta-kiosk"
-mkdir -p "$share/debs" "$root/usr/bin" "$root/usr/share/applications" "$root/DEBIAN"
+mkdir -p "$share/debs" "$root/usr/bin" "$root/usr/share/applications" "$root/DEBIAN" \
+  "$root/usr/share/icons/hicolor/512x512/apps" "$root/usr/share/metainfo"
 for f in "${FILES[@]}"; do cp "$HERE/$f" "$share/"; done
 chmod 755 "$share"/*.sh
 cp -r "$HERE/debs/$bn" "$share/debs/"
@@ -86,9 +87,37 @@ Type=Application
 Name=Sekta kiosk
 Comment=Встановлення kiosk-дисплея та екрани й сайти (Ctrl+Alt+K)
 Exec=/usr/bin/sekta-kiosk
-Icon=video-display
+Icon=sekta-kiosk
 Terminal=false
 Categories=Settings;
+EOF
+cp "$HERE/sekta-kiosk.png" "$root/usr/share/icons/hicolor/512x512/apps/sekta-kiosk.png"
+
+# AppStream: «Програми» (GNOME Software) shows a proper page — name, icon,
+# description, «Встановити» — when the .deb is opened with a double click
+cat > "$root/usr/share/metainfo/ua.sekta.kiosk.metainfo.xml" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>ua.sekta.kiosk</id>
+  <name>Sekta kiosk</name>
+  <summary>Kiosk-дисплей SEKTA без інтернету</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <developer id="ua.sekta"><name>SEKTA</name></developer>
+  <description>
+    <p>Встановлює kiosk-дисплей SEKTA без інтернету: екран завантаження з логотипом,
+    Chromium на весь екран на 1–3 екранах, автовхід, українська розкладка, без засинання.
+    Усі потрібні пакети — всередині ($bn).</p>
+    <p>Після встановлення — «Sekta kiosk» у меню програм (Ctrl+Alt+K): екрани, їхнє
+    розташування, масштаб і сайти.</p>
+  </description>
+  <launchable type="desktop-id">sekta-kiosk.desktop</launchable>
+  <icon type="stock">sekta-kiosk</icon>
+  <categories><category>Settings</category></categories>
+  <url type="homepage">https://github.com/EugeneSok/sekta-server-setup</url>
+  <releases><release version="$VERSION" date="$(date +%F)"/></releases>
+  <content_rating type="oars-1.1"/>
+</component>
 EOF
 
 size="$(du -sk "$root/usr" | cut -f1)"

@@ -103,6 +103,13 @@ the right of the layout.
 journalctl --user -u chromium-kiosk.service   # which output got which site
 ```
 
+**Zoom per screen** (`SCALES=(100 150)` in `screens.conf`, the app's
+«Масштаб» step): screens of different size each get their own zoom, set by
+the system (`xrandr --scale` / `wlr-randr --scale`), not by Chromium — the
+screens share one Chromium profile and its Ctrl+/− zoom is per site, so it
+would change every screen at once. Above 100 % text is a little soft
+(upscaled); a screen sees its zoomed size of the desktop.
+
 **Pages are remembered** (`RESTORE=auto` — with several screens; one screen
 always opens its sites, so an unattended dashboard comes back to it on every
 boot; `RESTORE=1` / `0` in `screens.conf` — always / never). Each screen reopens what was on it before the
@@ -185,8 +192,11 @@ One `.deb` per release and arch with everything inside — the sekta-kiosk app,
 the installer and all packages it needs (Chromium, Plymouth, zenity, wmctrl…
 with dependencies). The package has no dependencies of its own:
 
+Double-click the `.deb` → «Програми» (GNOME Software) opens its page (name,
+SEKTA icon, description) → «Встановити». Or in a terminal:
+
 ```bash
-sudo apt install ./sekta-kiosk_1.0.0+bookworm_amd64.deb   # no network needed
+sudo apt install ./sekta-kiosk_1.1.0+bookworm_amd64.deb   # no network needed
 ```
 
 Then **«Sekta kiosk»** in the app menu (or `sekta-kiosk` in a terminal):

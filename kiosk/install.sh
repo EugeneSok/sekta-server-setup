@@ -25,6 +25,8 @@
 #   curl -fsSL .../install.sh | KIOSK_SCREENS=2 KIOSK_LAYOUT=3 \
 #     KIOSK_URL="https://a.omega https://b.omega" bash
 # KIOSK_OUTPUTS="HDMI-1 HDMI-2" pins screens to outputs (default: primary first).
+# KIOSK_SCALE="100 150" zoom of each screen in % (50–300, default 100; set by
+# the system, not Chromium). Not given → kept from the current screens.conf.
 #
 # Sekta APP kiosk (Debian 12+, amd64 or arm64): instead of Chromium, install the LATEST
 # Sekta APP .deb from GitHub Releases (SHA-256 verified) and run it full-screen
@@ -541,7 +543,10 @@ systemctl --user daemon-reload 2>/dev/null || true
 # sekta-kiosk app: menu entry + Ctrl+Alt+K (gsettings needs the user bus,
 # hence after lingering). Not for the Sekta APP kiosk.
 if [ -x "$APP_BIN" ] && [ "$KIOSK_EXEC" = "$SCREENS_BIN" ]; then
-  "$APP_BIN" --integrate || warn "Could not add the sekta-kiosk menu entry / Ctrl+Alt+K."
+  icon_tmp="$(mktemp --suffix=.png)"
+  get_asset sekta-kiosk.png "$icon_tmp" 2>/dev/null || rm -f "$icon_tmp"
+  SEKTA_KIOSK_ICON="$icon_tmp" "$APP_BIN" --integrate || warn "Could not add the sekta-kiosk menu entry / Ctrl+Alt+K."
+  rm -f "$icon_tmp"
 fi
 # Earlier versions enabled the unit into graphical-session.target — drop that.
 systemctl --user disable "$SERVICE" 2>/dev/null || true
