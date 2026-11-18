@@ -453,7 +453,9 @@ else
     KIOSK_OUTPUTS="${OUTPUTS[*]}" KIOSK_CHROMIUM="$CHROMIUM_BIN" \
     "$SCREENS_BIN" --write-conf || die "Could not write $SCREENS_CONF."
   # new sites must win over pages saved by the previous install
-  "$SCREENS_BIN" --reset
+  [ -n "${KIOSK_KEEP_PAGES:-}" ] || "$SCREENS_BIN" --reset
+  # the app compares it with a package / stick to offer an update
+  get_asset VERSION "$(dirname "$SCREENS_CONF")/VERSION" 2>/dev/null || true
   # GNOME on Wayland can't arrange screens or move windows: Xorg for several
   if [ "$SCREENS" -gt 1 ]; then sudo bash "$SCREENS_BIN" --gdm x11; else sudo bash "$SCREENS_BIN" --gdm wayland; fi
 

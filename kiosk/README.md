@@ -179,6 +179,46 @@ systemctl --user status chromium-kiosk.service   # browser kiosk
 systemctl --user status sekta-kiosk.service      # Sekta APP
 ```
 
+## Offline package (Debian, no network)
+
+One `.deb` per release and arch with everything inside — the sekta-kiosk app,
+the installer and all packages it needs (Chromium, Plymouth, zenity, wmctrl…
+with dependencies). The package has no dependencies of its own:
+
+```bash
+sudo apt install ./sekta-kiosk_1.0.0+bookworm_amd64.deb   # no network needed
+```
+
+Then **«Sekta kiosk»** in the app menu (or `sekta-kiosk` in a terminal):
+
+- first start: installs the bundled packages (no zenity yet → a terminal opens,
+  sudo password there), then asks screens and sites in windows and installs
+  the kiosk (everything of pve-setup item 7); reboot;
+- later starts (menu, Ctrl+Alt+K): the screen manager above;
+- a newer package installed over it: the app offers to update the kiosk —
+  screens, sites and the open pages stay; «Перевстановити kiosk» in the menu
+  repairs a broken install with the same version.
+
+The user needs sudo. Debian installed **with a root password** has no sudo at
+all — the app shows the one command (as root, sudo comes from the package):
+`su - -c "apt install /usr/share/sekta-kiosk/debs/<release>-<arch>/sudo_*.deb && usermod -aG sudo $USER"`,
+then log out and in.
+
+Build (Docker; amd64 on an arm64 Mac works through emulation, ~2 min):
+
+```bash
+kiosk/build-deb.sh                  # bookworm amd64 (Debian 12)
+kiosk/build-deb.sh trixie amd64     # Debian 13
+FRESH=1 kiosk/build-deb.sh          # fetch the bundle again (else debs/<release>-<arch> is reused)
+kiosk/build-deb.sh --local          # on this machine: online Debian / RPi OS of the target's release and arch
+```
+
+→ `kiosk/dist/sekta-kiosk_<VERSION>+<release>_<arch>.deb` (~260–320 MB,
+gitignored). Raspberry Pi OS: build with `--local` on an online RPi — its
+Chromium comes from the Raspberry Pi repo, not Debian's. Version — `kiosk/VERSION`;
+raise it for a release, so displays with the old one get the update offer.
+Removing the package keeps the installed kiosk (`~/.local/bin`) and its menu entry.
+
 ## Offline install
 
 Same browser kiosk as `install.sh` — up to 3 sites as tabs or 2–3 screens,

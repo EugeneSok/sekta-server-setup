@@ -9,10 +9,15 @@
 #   - identify screens (output name and kiosk number on every monitor);
 #   - forget the remembered pages; restart / stop / start the kiosk.
 #
-# From a USB stick, next to install-offline.sh and debs/ — run in a terminal:
-#   bash /media/$USER/<stick>/kiosk/sekta-kiosk.sh
-# installs the whole kiosk (pve-setup menu item 7) offline, asking the settings
-# and the sudo password in windows.
+# Installer — next to install-offline.sh and debs/, it installs the whole kiosk
+# (pve-setup menu item 7) offline, asking the settings and the sudo password in
+# windows:
+#   - the Debian package sekta-kiosk (build-deb.sh; /usr/share/sekta-kiosk,
+#     menu «Sekta kiosk»): first start installs, later ones manage; a newer
+#     package offers to update the kiosk;
+#   - a USB stick: bash /media/$USER/<stick>/kiosk/sekta-kiosk.sh
+# Without zenity it opens a terminal, installs the bundled packages there
+# (install-offline.sh --packages-only, sudo password) and goes on in windows.
 #
 #   sekta-kiosk --integrate     menu entry + Ctrl+Alt+K (run by the installers)
 #   sekta-kiosk --unintegrate   remove them
@@ -35,6 +40,14 @@ KB_BINDING="<Control><Alt>k"
 DEFAULT_URL="https://combat.omega"
 TITLE="Sekta kiosk"
 LOG_FILE="$HOME/sekta-kiosk-install.log"
+# the Debian package (build-deb.sh)
+PKG_DIR=/usr/share/sekta-kiosk
+INSTALLED_VERSION_FILE="$HOME/.config/sekta-kiosk/VERSION"
+# where an offline install can come from: next to this script (stick or
+# package), else the installed package (the hotkey runs ~/.local/bin's copy)
+INSTALL_SRC=""
+if [ -f "$HERE/install-offline.sh" ]; then INSTALL_SRC="$HERE"
+elif [ -f "$PKG_DIR/install-offline.sh" ]; then INSTALL_SRC="$PKG_DIR"; fi
 
 # --- menu entry + hotkey -----------------------------------------------------
 have_gnome_keys() {
@@ -43,6 +56,8 @@ have_gnome_keys() {
 }
 
 integrate() {
+  # same desktop id as the package's entry: ours overrides it (one item in the
+  # menu) and stays when the package is removed
   mkdir -p "$(dirname "$DESKTOP_FILE")"
   cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
@@ -83,15 +98,75 @@ unintegrate() {
 case "${1:-}" in
   --integrate)   integrate; exit $? ;;
   --unintegrate) unintegrate; exit $? ;;
+  --install) ;;   # (re)install from INSTALL_SRC, then the menu
   "") ;;
-  *) echo "usage: sekta-kiosk [--integrate|--unintegrate]" >&2; exit 2 ;;
+  *) echo "usage: sekta-kiosk [--integrate|--unintegrate|--install]" >&2; exit 2 ;;
 esac
 
 # --- GUI helpers -------------------------------------------------------------
+BUNDLE_NAME="$( . /etc/os-release; echo "${VERSION_CODENAME:-unknown}")-$(dpkg --print-architecture 2>/dev/null)"
+# Debian installed with a root password has no sudo at all, and the first user
+# is not in the sudo group — the installer needs sudo (packages, Plymouth,
+# GRUB, autologin). The bundle carries sudo; one command as root fixes both.
+has_sudo() {
+  command -v sudo >/dev/null 2>&1 \
+    && { sudo -n true 2>/dev/null || id -nG | tr ' ' '\n' | grep -x sudo >/dev/null; }
+}
+sudo_hint() {
+  local deb=""
+  command -v sudo >/dev/null 2>&1 || deb="apt install $INSTALL_SRC/debs/$BUNDLE_NAME/sudo_*.deb && "
+  printf '%s\n' "Користувач $USER не має прав адміністратора (sudo)." \
+    "Один раз у терміналі, з паролем root:" \
+    "  su - -c \"${deb}usermod -aG sudo $USER\"" \
+    "потім вийти з сеансу й увійти знову (або перезавантажити) і запустити Sekta kiosk ще раз."
+}
+
+# No zenity yet (a bare Debian): install the bundled packages in a terminal —
+# sudo asks the password there — then go on in windows.
+if ! command -v zenity >/dev/null 2>&1 && [ -n "$INSTALL_SRC" ]; then
+  boot_dir="$(mktemp -d)"
+  {
+    echo "echo \$\$ > '$boot_dir/pid'"
+    if has_sudo; then
+      echo "echo 'Sekta kiosk: встановлення пакетів (без інтернету)…'"
+      echo "bash '$INSTALL_SRC/install-offline.sh' --packages-only || { echo; echo 'Не вдалося. Натисніть Enter.'; read -r _; }"
+    else
+      sudo_hint > "$boot_dir/hint"
+      echo "cat '$boot_dir/hint'"
+      echo "echo; echo 'Натисніть Enter.'; read -r _"
+    fi
+    echo "touch '$boot_dir/done'"
+  } > "$boot_dir/boot.sh"
+  if [ -t 0 ]; then
+    bash "$boot_dir/boot.sh"
+  else
+    started=""
+    for term in gnome-terminal kgx ptyxis x-terminal-emulator xterm; do
+      command -v "$term" >/dev/null 2>&1 || continue
+      case "$term" in
+        x-terminal-emulator|xterm) "$term" -e "bash $boot_dir/boot.sh" >/dev/null 2>&1 & ;;
+        *) "$term" -- bash "$boot_dir/boot.sh" >/dev/null 2>&1 & ;;
+      esac
+      # terminals often return at once (a server opens the window): watch the
+      # script itself — started within 20 s, then until it ends or the window
+      # is closed
+      for _ in $(seq 1 20); do [ -s "$boot_dir/pid" ] && break; sleep 1; done
+      if [ -s "$boot_dir/pid" ]; then
+        started=1
+        while kill -0 "$(cat "$boot_dir/pid")" 2>/dev/null && [ ! -e "$boot_dir/done" ]; do sleep 1; done
+        break
+      fi
+    done
+    if [ -z "$started" ] && command -v notify-send >/dev/null 2>&1; then
+      notify-send "Sekta kiosk" "Не вдалося відкрити термінал. Запустіть у терміналі: sekta-kiosk"
+    fi
+  fi
+  rm -rf "$boot_dir"
+fi
 if ! command -v zenity >/dev/null 2>&1; then
   echo "sekta-kiosk: потрібен zenity (sudo apt install zenity)." >&2
-  [ -f "$HERE/install-offline.sh" ] && \
-    echo "Без нього можна встановити з флешки в терміналі: bash $HERE/install-offline.sh" >&2
+  [ -n "$INSTALL_SRC" ] && \
+    echo "Без нього можна встановити в терміналі: bash $INSTALL_SRC/install-offline.sh" >&2
   exit 1
 fi
 [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || { echo "sekta-kiosk: потрібен графічний сеанс." >&2; exit 1; }
@@ -114,7 +189,7 @@ if command -v wmctrl >/dev/null 2>&1 && [ -z "${WAYLAND_DISPLAY:-}" ]; then
       wmctrl -lx 2>/dev/null | awk 'tolower($3) ~ /zenity/ { print $1 }' \
         | while read -r id; do wmctrl -i -r "$id" -b add,above 2>/dev/null; done
       sleep 1
-    done ) &
+    done ) 9>&- &   # not the lock: its sleep outlives a kill by up to 1 s
   ONTOP_PID=$!
 fi
 trap '[ -n "$ONTOP_PID" ] && kill "$ONTOP_PID" 2>/dev/null' EXIT
@@ -398,7 +473,8 @@ main_menu() {
     c="$(z --list --width=520 --height=380 --hide-header \
       --text="Екранів: $N. Kiosk $st.
 Що зробити?" --column="Дія" \
-      "Екрани й сайти" "Визначити екрани" "Повернути задані сайти" "Перезапустити kiosk" "$toggle")" || exit 0
+      "Екрани й сайти" "Визначити екрани" "Повернути задані сайти" "Перезапустити kiosk" "$toggle" \
+      ${INSTALL_SRC:+"Перевстановити kiosk ($(src_version))"})" || exit 0
     case "$c" in
       "Екрани й сайти")
         detect_outputs
@@ -409,6 +485,7 @@ main_menu() {
           ks_stop; "$SCREENS_BIN" --reset 2>/dev/null; ks_start
         fi ;;
       "Перезапустити kiosk") ks_stop; ks_start ;;
+      "Перевстановити kiosk"*) install_from_src ;;
       "Зупинити kiosk") ks_stop ;;
       "Запустити kiosk") ks_start ;;
     esac
@@ -417,22 +494,32 @@ main_menu() {
 
 # --- installer (from the stick) ----------------------------------------------
 installer() {
-  local bn
-  bn="$( . /etc/os-release; echo "${VERSION_CODENAME:-unknown}")-$(dpkg --print-architecture)"
-  if [ ! -d "$HERE/debs/$bn" ] && [ ! -f "$HERE/debs/BUNDLE" ]; then
-    err_box "На флешці немає пакетів для цієї машини ($bn).
-Є: $(cd "$HERE/debs" 2>/dev/null && ls -d */ 2>/dev/null | tr -d / | tr '\n' ' ')
-Зберіть їх на машині з тим самим релізом і архітектурою: ./fetch-debs.sh"
-    exit 1
+  local bn="$BUNDLE_NAME" before after
+  if [ ! -d "$INSTALL_SRC/debs/$bn" ] && [ ! -f "$INSTALL_SRC/debs/BUNDLE" ]; then
+    err_box "Немає пакетів для цієї машини ($bn) у $INSTALL_SRC/debs.
+Є: $(cd "$INSTALL_SRC/debs" 2>/dev/null && ls -d */ 2>/dev/null | tr -d / | tr '\n' ' ')
+Потрібен пакет sekta-kiosk для $bn (build-deb.sh) або набір fetch-debs.sh з такої машини."
+    return 1
   fi
 
+  if ! has_sudo; then err_box "$(esc "$(sudo_hint)")"; return 1; fi
   load_conf   # a reinstall starts from this machine's current settings
+  before="$SCREENS|${URLS[*]}|${LAYOUT[*]}|${OUTPUTS[*]}"
   detect_outputs
-  info_box "Встановлення kiosk-дисплея SEKTA з флешки, без інтернету ($bn).
+  info_box "Встановлення kiosk-дисплея SEKTA без інтернету ($bn, версія $(src_version)).
 
-Далі — екрани й сайти. Буде встановлено: екран завантаження з логотипом, Chromium на весь екран, автовхід, українська розкладка, без засинання; утиліта «Sekta kiosk — екрани» (Ctrl+Alt+K)." || exit 0
-  edit_screens "Встановити" || exit 0
+Далі — екрани й сайти. Буде встановлено: екран завантаження з логотипом, Chromium на весь екран, автовхід, українська розкладка, без засинання; утиліта «Sekta kiosk — екрани» (Ctrl+Alt+K)." || return 1
+  edit_screens "Встановити" || return 1
   export_settings
+  # same screens and sites: keep the remembered pages; an installed kiosk is
+  # overwritten in place, not torn down under the running session
+  after="$N|${KIOSK_URL}|${KIOSK_LAYOUT}|${KIOSK_OUTPUTS}"
+  if installed && [ "$(printf '%s' "$before" | tr -s ' ')" = "$(printf '%s' "$after" | tr -s ' ')" ]; then
+    export KIOSK_KEEP_PAGES=1
+  else
+    unset KIOSK_KEEP_PAGES
+  fi
+  if installed; then export REINSTALL=keep; else unset REINSTALL; fi
 
   # sudo inside install-offline.sh asks for the password in a window
   local t rc
@@ -440,7 +527,7 @@ installer() {
   printf '#!/bin/sh\nexec /usr/bin/sudo -A "$@"\n' > "$t/sudo"
   printf '#!/bin/sh\nexec zenity --password --title="%s — пароль адміністратора" 2>/dev/null\n' "$TITLE" > "$t/askpass"
   chmod 755 "$t/sudo" "$t/askpass"
-  ( cd "$HERE" && PATH="$t:$PATH" SUDO_ASKPASS="$t/askpass" bash ./install-offline.sh </dev/null ) 2>&1 \
+  ( cd "$INSTALL_SRC" && PATH="$t:$PATH" SUDO_ASKPASS="$t/askpass" bash ./install-offline.sh </dev/null ) 2>&1 \
     | tee "$LOG_FILE" \
     | sed -u 's/\x1b\[[0-9;]*m//g; s/^/# /' \
     | z --progress --pulsate --auto-close --no-cancel --width=640 --text="Встановлення…"
@@ -450,32 +537,46 @@ installer() {
   if [ "$rc" -ne 0 ]; then
     z --text-info --width=860 --height=520 --filename="$LOG_FILE" \
       --title="$TITLE — помилка встановлення (журнал: $LOG_FILE)"
-    exit 1
+    return 1
   fi
   if ask "Kiosk встановлено. Він запуститься після перезавантаження.
 
 Перезавантажити зараз?" --ok-label="Перезавантажити" --cancel-label="Пізніше"; then
     systemctl reboot
   fi
-  exit 0
+  return 0
 }
 
-if [ -f "$HERE/install-offline.sh" ] && [ "$SELF" != "$(readlink -f "$APP_BIN" 2>/dev/null)" ]; then
-  if [ -x "$SCREENS_BIN" ] && [ -f "$CONF" ]; then
-    c="$(z --list --width=520 --height=260 --hide-header --text="Kiosk уже встановлено на цій машині." \
-      --column="Дія" "Керувати kiosk (екрани й сайти)" "Перевстановити з флешки")" || exit 0
-    case "$c" in
-      "Перевстановити з флешки") installer ;;
-      "") exit 0 ;;
-    esac
-  else
-    installer
+src_version() { cat "$INSTALL_SRC/VERSION" 2>/dev/null || echo "?"; }
+installed_version() { cat "$INSTALLED_VERSION_FILE" 2>/dev/null || echo "0"; }
+installed() { [ -x "$SCREENS_BIN" ] && [ -f "$CONF" ]; }
+
+# (Re)install with the app that came with the installer: the copy in
+# ~/.local/bin (the hotkey) may be older than the package's install-offline.sh.
+install_from_src() {
+  if [ "$(readlink -f "$INSTALL_SRC/sekta-kiosk.sh")" != "$SELF" ]; then
+    if [ -n "$ONTOP_PID" ]; then kill "$ONTOP_PID" 2>/dev/null; fi   # exec skips the EXIT trap
+    exec bash "$INSTALL_SRC/sekta-kiosk.sh" --install
+  fi
+  installer
+}
+
+if [ "${1:-}" = "--install" ] && [ -n "$INSTALL_SRC" ]; then
+  installer
+elif ! installed; then
+  if [ -z "$INSTALL_SRC" ]; then
+    err_box "Kiosk на цій машині не встановлено (або встановлено старою версією без екранів).
+Встановіть його: пакет sekta-kiosk, пункт 7 pve-setup, kiosk/install.sh або з флешки — bash sekta-kiosk.sh."
+    exit 1
+  fi
+  installer || exit 1
+elif [ -n "$INSTALL_SRC" ] && [ "$(src_version)" != "?" ] \
+   && [ "$(printf '%s\n%s\n' "$(installed_version)" "$(src_version)" | sort -V | tail -1)" != "$(installed_version)" ]; then
+  # a newer package / stick than what was installed
+  if ask "Є новіша версія kiosk: $(src_version) (встановлено $(installed_version)).
+Оновити зараз? Екрани, сайти й відкриті сторінки лишаться як є." --ok-label="Оновити" --cancel-label="Пізніше"; then
+    install_from_src
   fi
 fi
-
-if [ ! -x "$SCREENS_BIN" ] || [ ! -f "$CONF" ]; then
-  err_box "Kiosk на цій машині не встановлено (або встановлено старою версією без екранів).
-Встановіть його: пункт 7 pve-setup, kiosk/install.sh або з флешки — bash sekta-kiosk.sh."
-  exit 1
-fi
+installed || exit 1
 main_menu

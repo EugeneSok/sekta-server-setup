@@ -19,6 +19,10 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# --packages-only: install the bundled packages and stop — the sekta-kiosk app
+# runs it in a terminal when zenity itself is missing, then goes on in windows
+PACKAGES_ONLY=""
+[ "${1:-}" = "--packages-only" ] && PACKAGES_ONLY=1
 # debs/<release>-<arch>/ — one stick can carry bundles for several machines
 # (fetch-debs.sh); a flat debs/ from an older fetch-debs.sh still works.
 BUNDLE_NAME="$( . /etc/os-release; echo "${VERSION_CODENAME:-unknown}")-$(dpkg --print-architecture)"
@@ -86,6 +90,7 @@ grub_add_params() {
   if [ -n "$changed" ]; then sudo update-grub; fi
 }
 
+if [ -z "$PACKAGES_ONLY" ]; then
 # --- Ask the user which address(es) the kiosk should open --------------------
 # KIOSK_URL may hold up to 3 space-separated URLs. One URL → locked --kiosk;
 # more → browser tabs in a maximised window (tab strip visible). With
@@ -202,6 +207,8 @@ if detect_existing; then
   fi
 fi
 
+fi   # PACKAGES_ONLY
+
 # --- Install the bundled .debs (no network) ----------------------------------
 # The bundle is the FULL closure (libc6, systemd, …). Only packages that are
 # missing here, or older than the bundled version, are installed — `dpkg -i *`
@@ -233,6 +240,7 @@ if [ "${#SELECTED[@]}" -gt 0 ]; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${SELECTED[@]}" || \
     die "Could not install offline. The debs/ set does not match this machine — re-run fetch-debs.sh on a machine with the same arch/release."
 fi
+if [ -n "$PACKAGES_ONLY" ]; then info "Bundled packages installed."; exit 0; fi
 
 # ============================================================================
 # PART 1 — Plymouth logo splash
@@ -348,8 +356,11 @@ install -m 755 "$HERE/sekta-kiosk.sh" "$APP_BIN.new" && mv -f "$APP_BIN.new" "$A
 KIOSK_SCREENS="$SCREENS" KIOSK_URL="${URLS[*]}" KIOSK_LAYOUT="${LAYOUT[*]}" \
   KIOSK_OUTPUTS="${OUTPUTS[*]}" KIOSK_CHROMIUM="$CHROMIUM_BIN" \
   "$SCREENS_BIN" --write-conf || die "Could not write $SCREENS_CONF."
-# new sites must win over pages saved by the previous install
-"$SCREENS_BIN" --reset
+# the app offers an update when the package / stick carries a newer one
+[ -f "$HERE/VERSION" ] && cp "$HERE/VERSION" "$(dirname "$SCREENS_CONF")/VERSION"
+# new sites must win over pages saved by the previous install (the app sets
+# KIOSK_KEEP_PAGES on an update with the same screens and sites)
+[ -n "${KIOSK_KEEP_PAGES:-}" ] || "$SCREENS_BIN" --reset
 # GNOME on Wayland can't arrange screens or move windows: Xorg for several
 if [ "$SCREENS" -gt 1 ]; then sudo bash "$SCREENS_BIN" --gdm x11; else sudo bash "$SCREENS_BIN" --gdm wayland; fi
 KIOSK_EXEC="$SCREENS_BIN"

@@ -56,6 +56,9 @@ info "Chromium package: $CHROMIUM_PKG"
 
 # keyboard-configuration / console-setup: UA layout (PART 3a of install-offline.sh)
 PKGS=(plymouth plymouth-themes "$CHROMIUM_PKG" x11-xserver-utils keyboard-configuration console-setup)
+# sudo: Debian installed with a root password has none — the sekta-kiosk app
+# tells to install it from the bundle (su -c "apt install …/sudo_*.deb")
+PKGS+=(sudo)
 # multi-screen kiosk (kiosk-screens.sh): wmctrl — windows of one Chromium on
 # their screens (X11); wlr-randr — screen layout on labwc/wayfire
 PKGS+=(wmctrl)
