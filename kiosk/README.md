@@ -53,6 +53,16 @@ curl -fsSL https://raw.githubusercontent.com/EugeneSok/sekta-server-setup/main/k
 - **No sleep** — system suspend/hibernate masked; `consoleblank=0` (GRUB).
 - **Autologin** — GDM3 or LightDM; without a display manager — TTY1 autologin
   (a graphical session is still needed). SDDM is not covered.
+- **No password windows after login** — GNOME lock screen and screen blanking
+  off; the "login" keyring gets an empty password (it stays locked after an
+  autologin and GNOME asks for it): the installer asks for the user's password
+  once (the app's admin password window, or the terminal; Enter skips), backup
+  `login.keyring.bak.<epoch>`; secrets then lie on disk unencrypted.
+- **No second kiosk** — the user's own units / autostart entries that start a
+  browser (made by hand before) are disabled (unit file kept; `.desktop` gets
+  `Hidden=true`, backup kept): two browsers on one profile broke the kiosk.
+- **GNOME overview** — GNOME 40+ opens Activities after login; the kiosk closes
+  it during its first minute (else its windows wait as thumbnails until a click).
 
 ## Several screens
 
@@ -87,7 +97,9 @@ full-screen window per screen:
   `WaylandEnable=false` in `/etc/gdm3/daemon.conf` (backup `*.bak.<epoch>`;
   after a reboot GNOME runs on Xorg). Reinstalling with one screen (or the
   Sekta APP) gives Wayland back — only if the installer was the one to turn it
-  off. Restored windows beyond the screen count are closed.
+  off. Restored windows beyond the screen count are closed. GNOME's Activities
+  overview, opened by GNOME after login, is closed during the kiosk's first
+  minute (else the windows wait there as thumbnails until a click).
 - **Wayland without X11** (labwc / wayfire) — one Chromium per screen through
   XWayland (`--ozone-platform=x11`); screens 2–3 have their own profiles
   (`~/.config/sekta-kiosk/chromium-N`), log in on each separately.
@@ -110,13 +122,31 @@ screens share one Chromium profile and its Ctrl+/− zoom is per site, so it
 would change every screen at once. Above 100 % text is a little soft
 (upscaled); a screen sees its zoomed size of the desktop.
 
+**Screensaver per screen** (`SAVERS=(…)`, `SAVER_HOURS=(…)`, `SAVER_SIZES=(…)`
+in `screens.conf`; the app's «Заставка»): after 1–12 hours without mouse /
+keyboard a screen goes black with its picture in the middle, sized 10–100 % of
+the screen (100 = as big as fits, proportions kept); any input takes it away.
+Pictures (png, jpg, webp, bmp, gif, svg, ≤ 50 MB) are copied to
+`~/.config/sekta-kiosk/saver/` (`sekta-kiosk-screens --saver-add FILE`), so a
+stick may go away; unused ones are deleted on the next `--write-conf`. The
+SEKTA logo of the boot splash is always there as `sekta.png` (the installers
+put it, `--saver-sekta` puts it back; «Лого SEKTA» in the editor), never deleted. The
+program is `~/.local/bin/sekta-kiosk-saver` (`kiosk-saver.py`, GTK 4), started
+with the kiosk. Idle time comes from GNOME (X11 and Wayland) or the X11
+XScreenSaver extension (`libxss1`); labwc / wayfire have neither — no
+screensaver there (a line in the journal says so). GNOME's own screen blanking
+(Settings → Power → Screen Blank) must be off or longer than the hours.
+`SEKTA_KIOSK_SAVER_HOUR=10` in the unit's environment makes an "hour" 10 s — to
+try it out.
+
 **Pages are remembered** (`RESTORE=auto` — with several screens; one screen
 always opens its sites, so an unattended dashboard comes back to it on every
 boot; `RESTORE=1` / `0` in `screens.conf` — always / never). Each screen reopens what was on it before the
-reboot / restart (`--restore-last-session`: pages, history, scroll position —
-as far as the site allows), not the configured site. With one profile the
-restored windows go to the nearest screen; a screen left without one opens its
-configured site. First start, or after a
+reboot / restart — the address its window showed last, read from Chromium's
+saved session (window k of the last run = screen k), opened as a fresh kiosk
+window (`--restore-last-session` brought a window back with tabs and the
+address bar; it is used only with one screen and `RESTORE=1`). A screen with
+nothing saved opens its configured site. First start, or after a
 reset, opens the configured sites. Reinstalling resets too, so new sites apply.
 
 ```bash
@@ -144,7 +174,9 @@ a dedicated user for the display.
 - **Екрани й сайти** (the main window) — add / remove a screen (up to 3);
   «Змінити екран» (or a double click on it): its site, output (`авто` or a
   name like `HDMI-2`), where it stands (a click on the clock hour around
-  screen 1) and its zoom; one screen may hold several sites as tabs. The zoom of
+  screen 1), its zoom and its screensaver (a picture, after how many idle
+  hours, its size; «Показати» shows it on that screen right away until the
+  mouse moves or a key is pressed); one screen may hold several sites as tabs. The zoom of
   the selected screen also changes right in the main window: «−» / «+» (steps
   50–300 %) and «100 %», applied with «Застосувати».
 - **«Зібрати діагностику»** (menu) shows on screen what the last kiosk start did

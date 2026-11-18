@@ -236,20 +236,26 @@ trap '[ -n "$ONTOP_PID" ] && kill "$ONTOP_PID" 2>/dev/null' EXIT
 KS="$SCREENS_BIN"
 [ -x "$KS" ] || KS="$HERE/kiosk-screens.sh"
 
-# --- settings: N screens, S_URL / S_HOUR / S_OUT per screen (0-based) ---------
+SAVER_DIR="$HOME/.config/sekta-kiosk/saver"   # screensaver pictures (--saver-add)
+
+# --- settings: N screens, S_URL / S_HOUR / S_OUT / S_SCALE / S_SAVER (picture
+# in ~/.config/sekta-kiosk/saver, - = none) / S_SHOURS / S_SSIZE per screen ----
 load_conf() {
-  SCREENS=1; URLS=("$DEFAULT_URL"); LAYOUT=(); OUTPUTS=(); SCALES=()
+  SCREENS=1; URLS=("$DEFAULT_URL"); LAYOUT=(); OUTPUTS=(); SCALES=(); SAVERS=(); SAVER_HOURS=(); SAVER_SIZES=()
   # shellcheck source=/dev/null
   [ -f "$CONF" ] && . "$CONF"
   [ "${#URLS[@]}" -gt 0 ] || URLS=("$DEFAULT_URL")
   N="$SCREENS"
-  S_URL=(); S_HOUR=(-); S_OUT=(); S_SCALE=()
+  S_URL=(); S_HOUR=(-); S_OUT=(); S_SCALE=(); S_SAVER=(); S_SHOURS=(); S_SSIZE=()
   local i
   if [ "$N" -eq 1 ]; then S_URL=("${URLS[*]}"); else
     for ((i = 0; i < N; i++)); do S_URL+=("${URLS[$i]:-${URLS[0]}}"); done
   fi
   for ((i = 1; i < N; i++)); do S_HOUR+=("${LAYOUT[$((i - 1))]:-3}"); done
-  for ((i = 0; i < N; i++)); do S_OUT+=("${OUTPUTS[$i]:--}"); S_SCALE+=("${SCALES[$i]:-100}"); done
+  for ((i = 0; i < N; i++)); do
+    S_OUT+=("${OUTPUTS[$i]:--}"); S_SCALE+=("${SCALES[$i]:-100}")
+    S_SAVER+=("${SAVERS[$i]:--}"); S_SHOURS+=("${SAVER_HOURS[$i]:-1}"); S_SSIZE+=("${SAVER_SIZES[$i]:-50}")
+  done
   LOADED_KEY="$(state_key)"
 }
 
@@ -302,6 +308,26 @@ where_label() {
 }
 scale_label() { if [ "$N" -eq 1 ]; then echo "—"; else echo "${S_SCALE[$1]} %"; fi; }
 out_label() { if [ "${S_OUT[$1]}" = - ]; then echo "авто"; else echo "${S_OUT[$1]}"; fi; }
+# 1 година, 2 години, 5 годин
+hours_word() {
+  local h="$1"
+  if [ $(( h % 10 )) -eq 1 ] && [ "$h" -ne 11 ]; then echo "$h година"
+  elif [ $(( h % 10 )) -ge 2 ] && [ $(( h % 10 )) -le 4 ] && { [ "$h" -lt 12 ] || [ "$h" -gt 14 ]; }; then echo "$h години"
+  else echo "$h годин"; fi
+}
+saver_label() {
+  local what=""
+  [ "${S_SAVER[$1]}" = sekta.png ] && what="лого SEKTA, "
+  if [ "${S_SAVER[$1]}" = - ]; then echo "немає"; else echo "${what}через $(hours_word "${S_SHOURS[$1]}") · ${S_SSIZE[$1]} %"; fi
+}
+# the screensaver program (kiosk-saver.py) — installed, else next to the app
+saver_bin() {
+  local p
+  for p in "$HOME/.local/bin/sekta-kiosk-saver" "$INSTALL_SRC/kiosk-saver.py" "$HERE/kiosk-saver.py"; do
+    [ -f "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
 
 # --- screen editor -----------------------------------------------------------
 edit_screen() {
@@ -365,6 +391,66 @@ $OUT_NOTE}" \
     [ -n "$o" ] && S_SCALE[$i]="$o"
   fi
 
+  # screensaver: a picture on black after 1–12 idle hours
+  rows=()
+  if [ "${S_SAVER[$i]}" != - ]; then
+    rows+=(TRUE "keep" "Лишити поточну картинку")
+    [ "${S_SAVER[$i]}" != sekta.png ] && rows+=(FALSE "sekta" "Лого SEKTA")
+    rows+=(FALSE "pick" "Вибрати іншу картинку…" FALSE "off" "Без заставки")
+  else
+    rows+=(TRUE "off" "Без заставки" FALSE "sekta" "Лого SEKTA" FALSE "pick" "Вибрати свою картинку…")
+  fi
+  o="$(z --list --radiolist --width=560 --height=300 --hide-column=2 --print-column=2 \
+    --text="Заставка екрана $((i + 1)): чорний екран з картинкою, коли ніхто не торкається миші й клавіатури.
+Зникає від будь-якого руху миші чи натискання клавіші." \
+    --column="" --column="" --column="Заставка" "${rows[@]}")" || return 0
+  case "$o" in
+    off) S_SAVER[$i]=- ;;
+    sekta)
+      local nm
+      if nm="$(bash "$KS" --saver-sekta 2>&1)"; then S_SAVER[$i]="$nm"
+      else err_box "Лого SEKTA не знайдено: $(esc "${nm#sekta-kiosk-screens: }")"; fi ;;
+    pick)
+      local f name start="/media/$USER"
+      [ -d "$start" ] || start="$HOME"
+      if f="$(cd "$start" && z --file-selection --filename="$start/" \
+          --file-filter="Картинки | *.png *.jpg *.jpeg *.webp *.bmp *.gif *.svg *.PNG *.JPG *.JPEG")"; then
+        # copied next to screens.conf — the stick may go away
+        if name="$(bash "$KS" --saver-add "$f" 2>&1)"; then S_SAVER[$i]="$name"
+        else err_box "Картинку не додано: $(esc "${name#sekta-kiosk-screens: }")"; fi
+      fi ;;
+  esac
+  if [ "${S_SAVER[$i]}" != - ]; then
+    rows=()
+    for ((k = 1; k <= 12; k++)); do
+      if [ "${S_SHOURS[$i]}" = "$k" ]; then sel=TRUE; else sel=FALSE; fi
+      rows+=("$sel" "$k" "$(hours_word "$k")")
+    done
+    o="$(z --list --radiolist --width=560 --height=480 --hide-column=2 --print-column=2 \
+      --text="Через скільки годин бездіяльності вмикається заставка екрана $((i + 1))?" \
+      --column="" --column="" --column="Час" "${rows[@]}")" || return 0
+    [ -n "$o" ] && S_SHOURS[$i]="$o"
+    # picture size, % of the screen
+    rows=()
+    for k in 100 75 50 33 25 10; do
+      if [ "${S_SSIZE[$i]}" = "$k" ]; then sel=TRUE; else sel=FALSE; fi
+      case "$k" in 100) h="на весь екран (пропорції зберігаються)" ;; *) h="$k % екрана" ;; esac
+      rows+=("$sel" "$k" "$h")
+    done
+    case " 100 75 50 33 25 10 " in *" ${S_SSIZE[$i]} "*) ;; *) rows+=(TRUE "${S_SSIZE[$i]}" "${S_SSIZE[$i]} % екрана") ;; esac
+    o="$(z --list --radiolist --width=560 --height=380 --hide-column=2 --print-column=2 \
+      --text="Розмір картинки заставки екрана $((i + 1))" \
+      --column="" --column="" --column="Розмір" "${rows[@]}")" || return 0
+    [ -n "$o" ] && S_SSIZE[$i]="$o"
+    # «Показати»: the screensaver now — gone on mouse / key
+    local prog
+    while ask "Заставка екрана $((i + 1)): через $(hours_word "${S_SHOURS[$i]}"), ${S_SSIZE[$i]} % екрана.
+Показати, як вона виглядатиме? Зникне від руху миші чи клавіші." --ok-label="Показати" --cancel-label="Далі"; do
+      if ! prog="$(saver_bin)"; then err_box "Немає програми заставки (sekta-kiosk-saver) — перевстановіть kiosk."; break; fi
+      python3 "$prog" --now "${S_OUT[$i]}" 1 "${S_SSIZE[$i]}" "$SAVER_DIR/${S_SAVER[$i]}" >/dev/null 2>&1 </dev/null 9>&-
+    done
+  fi
+
   # site
   local t="Сайт для екрана $((i + 1)):"
   [ "$N" -eq 1 ] && t="Сайт. Кілька сайтів — через пробіл, відкриються вкладками:"
@@ -380,7 +466,7 @@ add_screen() {
   read -r first rest <<< "${S_URL[0]}"
   # tabs are for one screen only — with several, each screen has one site
   S_URL[0]="$first"
-  S_URL+=("$first"); S_HOUR+=(3); S_OUT+=(-); S_SCALE+=(100)
+  S_URL+=("$first"); S_HOUR+=(3); S_OUT+=(-); S_SCALE+=(100); S_SAVER+=(-); S_SHOURS+=(1); S_SSIZE+=(50)
   N=$((N + 1))
   edit_screen $((N - 1))
 }
@@ -397,6 +483,9 @@ remove_screen() {
   S_OUT=("${S_OUT[@]:0:k}" "${S_OUT[@]:k+1}")
   S_HOUR=("${S_HOUR[@]:0:k}" "${S_HOUR[@]:k+1}")
   S_SCALE=("${S_SCALE[@]:0:k}" "${S_SCALE[@]:k+1}")
+  S_SAVER=("${S_SAVER[@]:0:k}" "${S_SAVER[@]:k+1}")
+  S_SHOURS=("${S_SHOURS[@]:0:k}" "${S_SHOURS[@]:k+1}")
+  S_SSIZE=("${S_SSIZE[@]:0:k}" "${S_SSIZE[@]:k+1}")
   S_HOUR[0]=-   # the (new) screen 1 is the centre, it has no hour
   N=$((N - 1))
   [ "$k" -eq 0 ] && info_box "Головним став колишній екран 2. Перевірте, де стоять інші екрани відносно нього."
@@ -408,11 +497,12 @@ edit_screens() {
   while :; do
     rows=()
     for ((i = 0; i < N; i++)); do
-      rows+=("$((i + 1))" "$(out_label "$i")" "$(where_label "$i")" "$(scale_label "$i")" "${S_URL[$i]}")
+      rows+=("$((i + 1))" "$(out_label "$i")" "$(where_label "$i")" "$(scale_label "$i")" "$(saver_label "$i")"
+        "${S_URL[$i]}")
     done
-    choice="$(z --list --width=940 --height=340 \
-      --text="Екрани kiosk-дисплея. Виберіть екран і натисніть «Змінити» — вихід, розташування, масштаб, сайт." \
-      --column="№" --column="Вихід" --column="Де стоїть" --column="Масштаб" --column="Сайт" \
+    choice="$(z --list --width=1060 --height=340 \
+      --text="Екрани kiosk-дисплея. Виберіть екран і натисніть «Змінити» — вихід, розташування, масштаб, заставка, сайт." \
+      --column="№" --column="Вихід" --column="Де стоїть" --column="Масштаб" --column="Заставка" --column="Сайт" \
       --ok-label="Змінити" --cancel-label="Скасувати" \
       --extra-button="Додати екран" --extra-button="Прибрати екран" --extra-button="$done_label" \
       "${rows[@]}")"
@@ -435,7 +525,8 @@ export_settings() {
     for ((i = 0; i < N; i++)); do read -r w _ <<< "${S_URL[$i]}"; urls+=("$w"); done
   fi
   export KIOSK_SCREENS="$N" KIOSK_URL="${urls[*]}" KIOSK_LAYOUT="${S_HOUR[*]:1}" KIOSK_OUTPUTS="${S_OUT[*]}" \
-    KIOSK_SCALE="${S_SCALE[*]}"
+    KIOSK_SCALE="${S_SCALE[*]}" KIOSK_SAVER="${S_SAVER[*]}" KIOSK_SAVER_HOURS="${S_SHOURS[*]}" \
+    KIOSK_SAVER_SIZE="${S_SSIZE[*]}"
 }
 
 # --- kiosk control -----------------------------------------------------------
@@ -464,8 +555,8 @@ apply_screens() {
   fi
   load_conf
   after="$LOADED_KEY"
-  # Any change of screens or sites: forget the remembered pages — restored
-  # windows go to the nearest screen, after a new layout that is the wrong one.
+  # Any change of screens or sites: forget the remembered pages — they are
+  # matched to screens by order, after a new layout that is the wrong one.
   # (The kiosk is stopped: Chromium would save its session again on exit.)
   [ "$before" != "$after" ] && "$SCREENS_BIN" --reset 2>/dev/null
 

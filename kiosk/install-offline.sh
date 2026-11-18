@@ -45,6 +45,7 @@ SCREENS_BIN="$HOME/.local/bin/sekta-kiosk-screens"
 SCREENS_CONF="$HOME/.config/sekta-kiosk/screens.conf"
 APP_BIN="$HOME/.local/bin/sekta-kiosk"   # sekta-kiosk app, as in install.sh
 GUI_BIN="$HOME/.local/bin/sekta-kiosk-gui"   # its GTK window
+SAVER_BIN="$HOME/.local/bin/sekta-kiosk-saver"   # screensaver of the screens (kiosk-saver.py)
 
 info()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -62,6 +63,7 @@ for asset in logo.png bar_track.png bar_fill.png kiosk-screens.sh sekta-kiosk.sh
 done
 # the app's GTK window — without it the app shows zenity windows
 [ -f "$HERE/sekta-kiosk-gui.py" ] || warn "No sekta-kiosk-gui.py — the sekta-kiosk app falls back to zenity windows."
+[ -f "$HERE/kiosk-saver.py" ] || warn "No kiosk-saver.py — the screens get no screensaver."
 # only the menu icon — without it the app gets a generic one
 [ -f "$HERE/sekta-kiosk.png" ] || warn "No sekta-kiosk.png — the menu entry gets a generic icon."
 
@@ -205,7 +207,7 @@ if detect_existing; then
     done
     systemctl --user daemon-reload 2>/dev/null || true
     if [ -x "$APP_BIN" ]; then "$APP_BIN" --unintegrate 2>/dev/null || true; fi
-    rm -f "$LAUNCHER" "$XDG_AUTOSTART" "$SCREENS_BIN" "$SCREENS_CONF" "$APP_BIN" "$GUI_BIN"
+    rm -f "$LAUNCHER" "$XDG_AUTOSTART" "$SCREENS_BIN" "$SCREENS_CONF" "$APP_BIN" "$GUI_BIN" "$SAVER_BIN"
     [ -f "$LABWC_AUTOSTART" ] && sed -i "/$AUTOSTART_MARK\$/d" "$LABWC_AUTOSTART"
     [ -d "$THEME_DIR" ] && sudo rm -rf "$THEME_DIR"
     info "Previous install removed."
@@ -243,7 +245,7 @@ APT_LOCAL=(-o Dir::Etc::SourceList="$REPO/sources.list" -o Dir::Etc::SourceParts
            -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= -o Acquire::Languages=none)
 WANT=()
 for p in plymouth plymouth-themes chromium chromium-browser x11-xserver-utils \
-         keyboard-configuration console-setup wmctrl wlr-randr python3-gi python3-gi-cairo gir1.2-gtk-4.0 zenity pkexec; do
+         keyboard-configuration console-setup wmctrl wlr-randr python3-gi python3-gi-cairo gir1.2-gtk-4.0 zenity pkexec libxss1; do
   if grep -x "Package: $p" "$REPO/Packages" >/dev/null; then WANT+=("$p"); fi
 done
 sudo apt-get "${APT_LOCAL[@]}" update -qq || { sudo rm -rf "$REPO"; die "Could not read the bundled packages ($DEBS_DIR)."; }
@@ -374,6 +376,11 @@ if [ -f "$HERE/sekta-kiosk-gui.py" ]; then
 else
   rm -f "$GUI_BIN"   # an older window must not drive the new launcher: zenity
 fi
+if [ -f "$HERE/kiosk-saver.py" ]; then
+  install -m 755 "$HERE/kiosk-saver.py" "$SAVER_BIN.new" && mv -f "$SAVER_BIN.new" "$SAVER_BIN"
+fi
+# the SEKTA logo of the splash: a screensaver picture always at hand
+"$SCREENS_BIN" --saver-sekta "$HERE/logo.png" >/dev/null || warn "No SEKTA logo for the screensaver."
 KIOSK_SCREENS="$SCREENS" KIOSK_URL="${URLS[*]}" KIOSK_LAYOUT="${LAYOUT[*]}" \
   KIOSK_OUTPUTS="${OUTPUTS[*]}" KIOSK_CHROMIUM="$CHROMIUM_BIN" \
   "$SCREENS_BIN" --write-conf || die "Could not write $SCREENS_CONF."
@@ -405,6 +412,11 @@ ExecStartPre=-/usr/bin/xset -dpms
 ExecStart=$KIOSK_EXEC
 Restart=on-failure
 RestartSec=3
+# Stop: SIGTERM to the launcher only, it closes Chromium, which then saves
+# its session and marks a clean exit (control-group would TERM every Chromium
+# process at once — an "unclean" exit, and the pages were never restored).
+KillMode=mixed
+TimeoutStopSec=20
 EOF
 
 # Launcher: pass the session's display to the user manager, start the unit.
@@ -459,7 +471,7 @@ else
 fi
 
 # ============================================================================
-# PART 3 — system tweaks: UA keyboard, no screen sleep, autologin
+# PART 3 — system tweaks: UA keyboard, no screen sleep, autologin, session
 # ============================================================================
 
 # --- 3a. Ukrainian keyboard layout (us default + ua, Alt+Shift toggle) -------
@@ -567,5 +579,99 @@ EOF
   warn "No display manager found — set TTY1 autologin for '$USER'."
   warn "A graphical session (startx / a display manager) is still needed for the kiosk."
 fi
+
+# --- 3d. Session: no lock screen, no keyring password, no second kiosk ------
+# Autologin alone still left password windows: GNOME's lock screen, and the
+# "login" keyring — locked after an autologin, unlocked by its password only.
+# A kiosk unit / autostart entry made by hand earlier started a second browser
+# on the same profile at login. All in the user's session (needs its bus).
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+if command -v gsettings >/dev/null 2>&1 \
+  && gsettings list-keys org.gnome.desktop.screensaver >/dev/null 2>&1; then
+  if gsettings set org.gnome.desktop.screensaver lock-enabled false 2>/dev/null \
+    && gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null; then
+    info "GNOME: lock screen and screen blanking off."
+  else
+    warn "GNOME: could not turn the lock screen off (no session yet?)."
+  fi
+fi
+
+# Keyring password → empty (the secrets stay; on disk unencrypted then).
+# $1 = current password; rc 0 = changed, 1 = wrong password, 2 = no keyring service
+keyring_nopass() {
+  KEYRING_PW="$1" python3 -I - <<'PY' 2>/dev/null
+import os, sys
+try:
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    def call(path, iface, method, args, sig):
+        return bus.call_sync("org.freedesktop.secrets", path, iface, method, args,
+                             GLib.VariantType.new(sig), Gio.DBusCallFlags.NO_AUTO_START, 10000, None).unpack()
+    _, sess = call("/org/freedesktop/secrets", "org.freedesktop.Secret.Service", "OpenSession",
+                   GLib.Variant("(sv)", ("plain", GLib.Variant("s", ""))), "(vo)")
+except Exception:
+    sys.exit(2)
+sec = lambda s: (sess, b"", s.encode(), "text/plain")
+try:
+    call("/org/freedesktop/secrets", "org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface",
+         "ChangeWithMasterPassword",
+         GLib.Variant("(o(oayays)(oayays))", ("/org/freedesktop/secrets/collection/login",
+                                              sec(os.environ["KEYRING_PW"]), sec(""))), "()")
+except Exception:
+    sys.exit(1)
+PY
+}
+KEYRING_FILE="$HOME/.local/share/keyrings/login.keyring"
+if [ -f "$KEYRING_FILE" ] && python3 -c 'import gi' 2>/dev/null; then
+  krc=0; keyring_nopass "" || krc=$?
+  if [ "$krc" = 0 ]; then
+    info "Keyring: without a password."
+  elif [ "$krc" = 2 ]; then
+    warn "Keyring: the keyring service is not running — password left (reinstall from the desktop)."
+  else
+    kpw=""
+    if [ -n "${SUDO_ASKPASS:-}" ] && [ -x "$SUDO_ASKPASS" ]; then
+      kpw="$("$SUDO_ASKPASS" "Пароль користувача $USER (сховище ключів)" 2>/dev/null || true)"
+    elif { : < /dev/tty; } 2>/dev/null; then
+      printf 'Password of %s to take it off the login keyring (Enter = skip): ' "$USER" > /dev/tty
+      IFS= read -rs kpw < /dev/tty || kpw=""
+      echo > /dev/tty
+    fi
+    if [ -z "$kpw" ]; then
+      warn "Keyring: password left — GNOME may ask for it after login."
+    else
+      cp -a "$KEYRING_FILE" "$KEYRING_FILE.bak.$(date +%s)"
+      if keyring_nopass "$kpw"; then
+        info "Keyring: password removed (no password window after login)."
+      else
+        warn "Keyring: wrong password — left as it was."
+      fi
+    fi
+    unset kpw
+  fi
+fi
+
+# Other kiosk launchers of this user (a browser started by an own unit or an
+# autostart entry): disabled — two browsers on one profile fight over it.
+for u in "$HOME"/.config/systemd/user/*.service; do
+  [ -f "$u" ] || continue
+  case "$(basename "$u")" in chromium-kiosk.service|sekta-kiosk.service) continue ;; esac
+  grep -E '^ExecStart=.*(chromium|chrome|firefox)' "$u" >/dev/null 2>&1 || continue
+  if systemctl --user is-enabled "$(basename "$u")" >/dev/null 2>&1; then
+    if systemctl --user disable "$(basename "$u")" >/dev/null 2>&1; then
+      warn "Disabled another kiosk unit: $(basename "$u") (file kept)."
+    fi
+  fi
+done
+for a in "$HOME"/.config/autostart/*.desktop; do
+  [ -f "$a" ] || continue
+  case "$(basename "$a")" in sekta-kiosk*.desktop) continue ;; esac
+  grep -E '^Exec=.*(chromium|chrome|firefox)' "$a" >/dev/null 2>&1 || continue
+  grep -E '^Hidden=true' "$a" >/dev/null 2>&1 && continue
+  cp -a "$a" "$a.bak.$(date +%s)"
+  echo "Hidden=true" >> "$a"
+  warn "Disabled another browser autostart: $(basename "$a") (backup kept)."
+done
 
 info "Done. Reboot to see the splash and kiosk:  sudo reboot"

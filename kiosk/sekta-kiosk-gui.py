@@ -6,7 +6,8 @@
 # keeps its zenity windows). sekta-kiosk.sh holds the single-instance lock,
 # makes the menu entry / hotkey and installs the bundled packages on a bare
 # Debian; this file is the window:
-#   - screens as they stand around screen 1: output, clock hour, zoom, site;
+#   - screens as they stand around screen 1: output, clock hour, zoom, site,
+#     screensaver (a picture on black after 1–12 idle hours, its size, «Показати»);
 #     «Застосувати» writes screens.conf (kiosk-screens.sh --write-conf),
 #     switches GNOME Wayland ⇄ Xorg (pkexec) and restarts the kiosk;
 #   - identify screens, restore the sites, restart / stop / start the kiosk;
@@ -31,8 +32,9 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("PangoCairo", "1.0")
+gi.require_version("GdkPixbuf", "2.0")
 gi.require_foreign("cairo")   # python3-gi-cairo: drawing the screens
-from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
 TITLE = "Sekta kiosk"
 HOME = os.path.expanduser("~")
@@ -40,6 +42,10 @@ BIN = os.path.join(HOME, ".local/bin")
 SCREENS_BIN = os.path.join(BIN, "sekta-kiosk-screens")
 START_BIN = os.path.join(BIN, "sekta-kiosk-start")
 CONF = os.path.join(HOME, ".config/sekta-kiosk/screens.conf")
+SAVER_DIR = os.path.join(HOME, ".config/sekta-kiosk/saver")   # pictures (kiosk-screens.sh --saver-add)
+SAVER_TYPES = ("png", "jpg", "jpeg", "webp", "bmp", "gif", "svg")
+SAVER_BIN = os.path.join(BIN, "sekta-kiosk-saver")   # kiosk-saver.py
+SAVER_SEKTA = "sekta.png"   # the SEKTA logo, always there (kiosk-screens.sh --saver-sekta)
 INSTALLED_VERSION_FILE = os.path.join(HOME, ".config/sekta-kiosk/VERSION")
 SERVICE = "chromium-kiosk.service"
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
@@ -118,6 +124,7 @@ progressbar.sk-bar progress { background: #5f6f34; min-height: 8px; border-radiu
 textview.sk-log, textview.sk-log text { background: #e4e5d9; color: #4a4e3f; font-family: monospace; font-size: 9pt; }
 textview.sk-diag, textview.sk-diag text { background: #f7f7f0; color: #23271b; font-family: monospace; font-size: 10.5pt; }
 .sk-logbox { border: 1px solid #c7cab7; border-radius: 10px; }
+.sk-saver-prev { background: #000000; border-radius: 8px; }
 .sk-ident { background: #23271b; color: #ecede3; }
 .sk-ident-num { font-size: 96pt; font-weight: 700; color: #c3d38c; }
 .sk-ident-out { font-size: 28pt; font-family: monospace; }
@@ -303,24 +310,28 @@ def sudo_check(password):
 # --- settings ----------------------------------------------------------------
 class Conf:
     """screens.conf: N screens; url / hour (None for screen 1) / out ('-' =
-    auto) / scale per screen."""
+    auto) / scale / saver (picture in SAVER_DIR, '-' = none) / hours (idle
+    hours before it) / size (picture, % of the screen) per screen."""
 
     def __init__(self):
-        self.screens = [{"url": DEFAULT_URL, "hour": None, "out": "-", "scale": 100}]
+        self.screens = [new_screen(DEFAULT_URL, None)]
         self.raw = (1, [DEFAULT_URL], [], [])
 
     @classmethod
     def load(cls):
         c = cls()
-        script = ('SCREENS=1; URLS=(); LAYOUT=(); OUTPUTS=(); SCALES=(); [ -f "$1" ] && . "$1" >/dev/null 2>&1; '
+        script = ('SCREENS=1; URLS=(); LAYOUT=(); OUTPUTS=(); SCALES=(); SAVERS=(); SAVER_HOURS=(); SAVER_SIZES=(); '
+                  '[ -f "$1" ] && . "$1" >/dev/null 2>&1; '
                   'printf "S%s\\0" "$SCREENS"; printf "U%s\\0" "${URLS[@]}"; printf "L%s\\0" "${LAYOUT[@]}"; '
-                  'printf "O%s\\0" "${OUTPUTS[@]}"; printf "Z%s\\0" "${SCALES[@]}"')
+                  'printf "O%s\\0" "${OUTPUTS[@]}"; printf "Z%s\\0" "${SCALES[@]}"; '
+                  'printf "V%s\\0" "${SAVERS[@]}"; printf "H%s\\0" "${SAVER_HOURS[@]}"; '
+                  'printf "P%s\\0" "${SAVER_SIZES[@]}"')
         try:
             o = subprocess.run(["bash", "-c", script, "_", CONF], stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True).stdout
         except OSError:
             o = ""
-        vals = {"S": [], "U": [], "L": [], "O": [], "Z": []}
+        vals = {"S": [], "U": [], "L": [], "O": [], "Z": [], "V": [], "H": [], "P": []}
         for item in o.split("\0"):
             if item and item[0] in vals and len(item) > 1:
                 vals[item[0]].append(item[1:])
@@ -346,7 +357,18 @@ class Conf:
                 z = int(vals["Z"][i])
             except (IndexError, ValueError):
                 z = 100
-            c.screens.append({"url": url, "hour": hour, "out": o_ or "-", "scale": z})
+            sv = vals["V"][i] if i < len(vals["V"]) else "-"
+            try:
+                sh = int(vals["H"][i])
+            except (IndexError, ValueError):
+                sh = 1
+            try:
+                sz = int(vals["P"][i])
+            except (IndexError, ValueError):
+                sz = 50
+            c.screens.append({"url": url, "hour": hour, "out": o_ or "-", "scale": z,
+                              "saver": sv or "-", "hours": sh if 1 <= sh <= 12 else 1,
+                              "size": sz if 10 <= sz <= 100 else 50})
         return c
 
     def copy(self):
@@ -365,7 +387,10 @@ class Conf:
         return {"KIOSK_SCREENS": str(n), "KIOSK_URL": " ".join(urls),
                 "KIOSK_LAYOUT": " ".join(str(s["hour"]) for s in self.screens[1:]),
                 "KIOSK_OUTPUTS": " ".join(s["out"] for s in self.screens),
-                "KIOSK_SCALE": " ".join(str(s["scale"]) for s in self.screens)}
+                "KIOSK_SCALE": " ".join(str(s["scale"]) for s in self.screens),
+                "KIOSK_SAVER": " ".join(s["saver"] for s in self.screens),
+                "KIOSK_SAVER_HOURS": " ".join(str(s["hours"]) for s in self.screens),
+                "KIOSK_SAVER_SIZE": " ".join(str(s["size"]) for s in self.screens)}
 
     def key(self):
         """screens, sites, layout, outputs — what makes the remembered pages wrong."""
@@ -376,6 +401,26 @@ class Conf:
     def same(self, other):
         return [tuple(sorted(s.items())) for s in self.screens] == \
                [tuple(sorted(s.items())) for s in other.screens]
+
+
+def new_screen(url, hour):
+    return {"url": url, "hour": hour, "out": "-", "scale": 100, "saver": "-", "hours": 1, "size": 50}
+
+
+def hours_word(h):
+    """1 година, 2 години, 5 годин."""
+    if h % 10 == 1 and h != 11:
+        return "%d година" % h
+    if 2 <= h % 10 <= 4 and not 12 <= h <= 14:
+        return "%d години" % h
+    return "%d годин" % h
+
+
+def saver_label(sc):
+    if sc["saver"] == "-":
+        return "немає"
+    return "%sчерез %s · %d %%" % ("лого SEKTA, " if sc["saver"] == SAVER_SEKTA else "", hours_word(sc["hours"]),
+                                  sc["size"])
 
 
 def detect_outputs(ks):
@@ -777,7 +822,7 @@ class App(Gtk.Application):
         inner.append(head)
         self.grid = Gtk.Grid(row_spacing=12, column_spacing=12)
         self.grid_vals = {}
-        for r, key in enumerate(("Сайт", "Вихід", "Де стоїть", "Масштаб")):
+        for r, key in enumerate(("Сайт", "Вихід", "Де стоїть", "Масштаб", "Заставка")):
             k = label(key, ["sk-muted"])
             k.set_valign(Gtk.Align.START)
             self.grid.attach(k, 0, r, 1, 1)
@@ -860,6 +905,7 @@ class App(Gtk.Application):
         size = sizes.get(got[self.sel] or "", "")
         self.grid_vals["Вихід"].set_label(o + (" · " + size if size else ""))
         self.grid_vals["Де стоїть"].set_label(self.where(self.sel))
+        self.grid_vals["Заставка"].set_label(saver_label(cur))
         z = cur["scale"]
         self.grid_vals["Масштаб"].set_label("%d %%" % z)
         for w in (self.zoom_minus, self.zoom_plus, self.zoom_reset, self.grid_vals["Масштаб"]):
@@ -1030,7 +1076,7 @@ class App(Gtk.Application):
             return
         first = (s[0]["url"].split() or [DEFAULT_URL])[0]
         s[0]["url"] = first   # tabs are for one screen only
-        s.append({"url": first, "hour": 3, "out": "-", "scale": 100})
+        s.append(new_screen(first, 3))
         self.sel = len(s) - 1
         self.refresh()
         self.open_editor(self.sel)
@@ -1137,6 +1183,68 @@ class App(Gtk.Application):
         self.ed_zoom_box.append(self.ed_zooms)
         body.append(self.ed_zoom_box)
 
+        # screensaver: picture on black after N idle hours
+        self.ed_saver, self.ed_saver_path = "-", ""
+        grp = vbox(10)
+        zt = hbox(10)
+        zt.append(label("Заставка", ["sk-label"]))
+        zt.append(label("чорний екран з картинкою, коли ніхто не торкається миші й клавіатури", ["sk-muted"],
+                        wrap=True))
+        grp.append(zt)
+        row = hbox(16)
+        frame = Gtk.Box()
+        frame.add_css_class("sk-saver-prev")
+        frame.set_size_request(192, 108)
+        frame.set_overflow(Gtk.Overflow.HIDDEN)
+        # the preview: a 192×108 (16:9) texture, black with the picture on it
+        self.ed_saver_pic = Gtk.Picture()
+        self.ed_saver_pic.set_can_shrink(False)
+        frame.append(self.ed_saver_pic)
+        # in a vertical box: measured for its own height, not the row's (a
+        # Picture asks for the width of its aspect at the height it is given)
+        fwrap = vbox()
+        fwrap.append(frame)
+        fwrap.set_valign(Gtk.Align.START)
+        row.append(fwrap)
+        col = vbox(10)
+        self.ed_saver_text = label("", ["sk-muted"], wrap=True)
+        col.append(self.ed_saver_text)
+        btns = hbox(10)
+        self.ed_saver_sekta = button("Лого SEKTA", "sk-btn", cb=self.sekta_saver)
+        self.ed_saver_sekta.set_tooltip_text("Вбудована заставка — логотип SEKTA")
+        btns.append(self.ed_saver_sekta)
+        btns.append(button("Вибрати картинку…", "sk-btn", "image-x-generic-symbolic", self.pick_saver))
+        self.ed_saver_show = button("Показати", "sk-btn", "view-reveal-symbolic", self.show_saver)
+        self.ed_saver_show.set_tooltip_text("Заставка зараз на цьому екрані — зникне від руху миші чи клавіші")
+        btns.append(self.ed_saver_show)
+        self.ed_saver_del = button("Без заставки", "sk-btn", "edit-delete-symbolic", lambda: self.set_saver("-"))
+        btns.append(self.ed_saver_del)
+        col.append(btns)
+        # size: % of the screen, the preview follows
+        self.ed_size_box = hbox(10)
+        self.ed_size_box.append(label("Розмір", ["sk-dim"]))
+        self.ed_size = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 10, 100, 5)
+        self.ed_size.set_size_request(260, -1)
+        self.ed_size.set_draw_value(False)
+        for v in (25, 50, 75, 100):
+            self.ed_size.add_mark(v, Gtk.PositionType.BOTTOM, "%d" % v)
+        self.ed_size.connect("value-changed", lambda *_: self.saver_size_changed())
+        self.ed_size_box.append(self.ed_size)
+        self.ed_size_val = label("", ["sk-title"])
+        self.ed_size_val.set_width_chars(13)
+        self.ed_size_box.append(self.ed_size_val)
+        col.append(self.ed_size_box)
+        self.ed_hours_box = hbox(10)
+        self.ed_hours_box.append(label("Вмикається через", ["sk-dim"]))
+        self.ed_hours = Gtk.DropDown.new_from_strings([hours_word(h) for h in range(1, 13)])
+        self.ed_hours_box.append(self.ed_hours)
+        self.ed_hours_box.append(label("бездіяльності", ["sk-dim"]))
+        col.append(self.ed_hours_box)
+        col.append(label("Зникає від будь-якого руху миші чи натискання клавіші.", ["sk-muted"], wrap=True))
+        row.append(col)
+        grp.append(row)
+        body.append(grp)
+
         scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         scroll.set_child(body)
         scroll.set_vexpand(True)
@@ -1234,8 +1342,121 @@ class App(Gtk.Application):
             b.set_active(z == sc["scale"])
             b.connect("toggled", lambda btn, v=z: btn.get_active() and setattr(self, "ed_zoom", v))
             self.ed_zooms.append(b)
+        # screensaver
+        self.ed_size.set_value(sc["size"])
+        self.set_saver(sc["saver"])
+        self.ed_hours.set_selected(sc["hours"] - 1)
         self.stack.set_visible_child_name("editor")
         self.ed_site.grab_focus_without_selecting()
+
+    def set_saver(self, name):
+        """The editor's screensaver picture (a name in SAVER_DIR, '-' = none)."""
+        self.ed_saver = name
+        on = name != "-"
+        path = os.path.join(SAVER_DIR, name) if on else ""
+        if on and not os.path.isfile(path) and name == SAVER_SEKTA:
+            run(["bash", self.ks, "--saver-sekta"])   # put back if it went missing
+        if on and not os.path.isfile(path):
+            self.ed_saver = "-"
+            on, path = False, ""
+        self.ed_saver_path = path
+        self.ed_saver_text.set_label(("Лого SEKTA" if name == SAVER_SEKTA else "Своя картинка")
+                                     + " поверх чорного, по центру екрана." if on
+                                     else "Немає — екран завжди показує сайт.")
+        self.ed_saver_sekta.set_visible(name != SAVER_SEKTA)
+        self.ed_saver_del.set_visible(on)
+        self.ed_saver_show.set_visible(on)
+        self.ed_hours_box.set_sensitive(on)
+        self.ed_size_box.set_sensitive(on)
+        self.saver_size_changed()
+
+    def saver_size_changed(self):
+        """Value label + the small preview: the picture at its size on a
+        192×108 «screen» (16:9)."""
+        z = int(self.ed_size.get_value())
+        self.ed_size_val.set_label("%d %% екрана" % z)
+        sw, sh = 192, 108
+        base = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, sw, sh)
+        base.fill(0x000000ff)
+        if self.ed_saver_path:
+            try:
+                _fmt, w, h = GdkPixbuf.Pixbuf.get_file_info(self.ed_saver_path)
+                k = min(sw / max(1, w), sh / max(1, h)) * z / 100
+                pw, ph = max(2, min(sw, round(w * k))), max(2, min(sh, round(h * k)))
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(self.ed_saver_path, pw, ph, False)
+                dx, dy = (sw - pw) // 2, (sh - ph) // 2
+                pb.composite(base, dx, dy, pw, ph, dx, dy, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
+            except (GLib.Error, TypeError):
+                pass
+        self.ed_saver_pic.set_paintable(Gdk.Texture.new_for_pixbuf(base))
+
+    def saver_bin(self):
+        for p in (SAVER_BIN, os.path.join(INSTALL_SRC, "kiosk-saver.py") if INSTALL_SRC else "",
+                  os.path.join(os.path.dirname(SELF), "kiosk-saver.py")):
+            if p and os.path.isfile(p):
+                return p
+        return ""
+
+    def show_saver(self):
+        """«Показати»: the screensaver now, on this screen's monitor."""
+        if self.ed_saver == "-":
+            return
+        prog = self.saver_bin()
+        if not prog:
+            self.error("Немає програми заставки (sekta-kiosk-saver) — перевстановіть kiosk.")
+            return
+        s = self.edit.screens
+        got = assign_outputs(s, self.outputs)
+        out_ = "-" if len(s) == 1 else (got[self.ed_i] or "-")
+        try:
+            subprocess.Popen(["python3", prog, "--now", out_, "1", str(int(self.ed_size.get_value())),
+                              os.path.join(SAVER_DIR, self.ed_saver)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError as e:
+            self.error("Заставку не показано: %s" % e)
+
+    def sekta_saver(self):
+        rc, o = run(["bash", self.ks, "--saver-sekta"])
+        if rc != 0 or o.strip().splitlines()[-1:] != [SAVER_SEKTA]:
+            self.error("Лого SEKTA не знайдено: %s" % o.strip().replace("sekta-kiosk-screens: ", ""))
+            return
+        self.set_saver(SAVER_SEKTA)
+
+    def pick_saver(self):
+        start = "/media/" + os.environ.get("USER", "")
+        if not os.path.isdir(start):
+            start = HOME
+        ch = Gtk.FileChooserNative(title=TITLE + " — картинка заставки", transient_for=self.win,
+                                   action=Gtk.FileChooserAction.OPEN, accept_label="Вибрати",
+                                   cancel_label="Скасувати")
+        f = Gtk.FileFilter()
+        f.set_name("Картинки (%s)" % ", ".join(SAVER_TYPES))
+        for ext in SAVER_TYPES:
+            f.add_pattern("*." + ext)
+            f.add_pattern("*." + ext.upper())
+        ch.add_filter(f)
+        try:
+            ch.set_current_folder(Gio.File.new_for_path(start))
+        except GLib.Error:
+            pass
+
+        def resp(dlg, r):
+            self.chooser = None
+            if r != Gtk.ResponseType.ACCEPT or not dlg.get_file():
+                return
+            path = dlg.get_file().get_path()
+            # copied next to screens.conf — the stick may go away
+            rc, o = run(["bash", self.ks, "--saver-add", path])
+            name = o.strip().splitlines()[-1] if rc == 0 and o.strip() else ""
+            if not name or "/" in name:
+                self.error("Картинку не додано: %s" % (o.strip().replace("sekta-kiosk-screens: ", "")
+                                                       or os.path.basename(path)))
+                return
+            self.set_saver(name)
+        ch.connect("response", resp)
+        self.chooser = ch   # keep a reference until it answers
+        ch.show()
 
     def editor_done(self):
         s = self.edit.screens
@@ -1261,6 +1482,9 @@ class App(Gtk.Application):
             sc["hour"] = self.ed_hour
         if len(s) > 1:
             sc["scale"] = self.ed_zoom
+        sc["saver"] = self.ed_saver
+        sc["hours"] = self.ed_hours.get_selected() + 1
+        sc["size"] = int(self.ed_size.get_value())
         self.sel = i
         self.refresh()
         self.stack.set_visible_child_name("main")
@@ -1331,8 +1555,8 @@ class App(Gtk.Application):
                 return {"fatal": "Не збережено: " + o.strip()}
             conf = Conf.load()
             # any change of screens or sites: forget the remembered pages —
-            # restored windows go to the nearest screen, after a new layout that
-            # is the wrong one (the kiosk is stopped: Chromium saves on exit)
+            # they are matched to screens by order, after a new layout that is
+            # the wrong one (the kiosk is stopped: Chromium saves on exit)
             if conf.key() != before:
                 run([SCREENS_BIN, "--reset"])
             n = len(conf.screens)

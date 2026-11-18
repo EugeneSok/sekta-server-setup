@@ -31,7 +31,7 @@ VERSION="$(cat "$HERE/VERSION")"
 info() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
-FILES=(install-offline.sh kiosk-screens.sh sekta-kiosk.sh sekta-kiosk-gui.py fetch-debs.sh
+FILES=(install-offline.sh kiosk-screens.sh kiosk-saver.py sekta-kiosk.sh sekta-kiosk-gui.py fetch-debs.sh
        logo.png bar_track.png bar_fill.png sekta-kiosk.png VERSION)
 
 if [ "${1:-}" != "--local" ]; then
@@ -64,7 +64,8 @@ release="$( . /etc/os-release; echo "${VERSION_CODENAME:-unknown}")"
 arch="$(dpkg --print-architecture)"
 bn="$release-$arch"
 
-# no bundle yet, or one made before sudo / GTK 4 joined fetch-debs.sh PKGS
+# no bundle yet, or one made before sudo / GTK 4 joined fetch-debs.sh PKGS (an
+# older bundle without libxss1 is fine: only the screensaver off GNOME needs it)
 if [ ! -f "$HERE/debs/$bn/BUNDLE" ] || ! ls "$HERE/debs/$bn"/sudo_*.deb >/dev/null 2>&1 \
    || ! ls "$HERE/debs/$bn"/python3-gi-cairo_*.deb >/dev/null 2>&1; then
   info "Fetching the package bundle debs/$bn…"

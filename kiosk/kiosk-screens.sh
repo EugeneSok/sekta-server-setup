@@ -20,6 +20,14 @@
 #                                 wlr-randr --scale), not by Chromium — its
 #                                 zoom is per site and the screens share one
 #                                 profile, so Ctrl+/- would change all of them
+#   SAVERS=(ab12cd34.png -)       screensaver picture of each screen (a file in
+#                                 ~/.config/sekta-kiosk/saver/, "-" = none;
+#                                 sekta.png = the SEKTA logo, always there):
+#                                 black screen with the picture after SAVER_HOURS
+#                                 without mouse / keyboard, gone on any input
+#   SAVER_HOURS=(3 1)             idle hours before it, 1–12, per screen
+#   SAVER_SIZES=(50 100)          picture size, % of the screen (10–100; 100 =
+#                                 as big as fits, proportions kept)
 #   CHROMIUM=/usr/bin/chromium
 #   CHROMIUM_FLAGS=(...)
 #   RESTORE=auto                  reopen each screen's pages from last time:
@@ -39,17 +47,28 @@
 # A closed window or Chromium exiting stops the rest and exits non-zero, so
 # systemd restarts the whole set.
 #
-# When restoring, a profile with a saved session starts with
-# --restore-last-session (pages, history, scroll) and no URL — a URL would add
-# a second tab. Without a session (first start, after --reset) it opens URLS.
+# When restoring on several screens, each screen opens the address its window
+# showed last time (read from Chromium's saved session; window k of the last run
+# = screen k, they are opened in that order) — as a fresh kiosk window, not by
+# --restore-last-session: a restored window came back as a plain browser window
+# with tabs and the address bar. One screen with RESTORE=1 still uses
+# --restore-last-session (pages, history, scroll). Without a session (first
+# start, after --reset) it opens URLS.
 #   sekta-kiosk-screens --reset   forget saved pages, next start opens URLS
 #                                 (stop the kiosk first — Chromium saves its
 #                                 session again when it exits)
 #   sekta-kiosk-screens --write-conf
 #       write screens.conf from KIOSK_SCREENS, KIOSK_URL, KIOSK_LAYOUT,
-#       KIOSK_OUTPUTS, KIOSK_SCALE, KIOSK_CHROMIUM, KIOSK_RESTORE
-#       (space-separated lists);
+#       KIOSK_OUTPUTS, KIOSK_SCALE, KIOSK_SAVER, KIOSK_SAVER_HOURS,
+#       KIOSK_SAVER_SIZE, KIOSK_CHROMIUM, KIOSK_RESTORE (space-separated lists);
 #       what is not given stays as in the current file. Exit 2 = bad value.
+#       Pictures in saver/ no screen uses any more are deleted.
+#   sekta-kiosk-screens --saver-add FILE
+#       copy a picture into ~/.config/sekta-kiosk/saver/, print its name there
+#       (for SAVERS / KIOSK_SAVER). Exit 2 = not a picture or too big.
+#   sekta-kiosk-screens --saver-sekta [LOGO]
+#       put the SEKTA logo there as sekta.png (LOGO, else the package's or the
+#       boot splash's logo.png), print "sekta.png". Never deleted as unused.
 #   sekta-kiosk-screens --outputs   connected outputs, "name WxH" per line
 #   sekta-kiosk-screens --gdm-status   no-gdm | wayland | x11 | x11-ours
 #   sekta-kiosk-screens --diag   a report for troubleshooting (stdout): system,
@@ -93,6 +112,14 @@ SCALE_MARK="${XDG_RUNTIME_DIR:-/tmp}/sekta-kiosk-screens.scale"
 DEFAULT_FLAGS=(--noerrdialogs --disable-infobars --disable-session-crashed-bubble
   --disable-features=Translate --no-first-run --check-for-update-interval=31536000
   --password-store=basic)
+# screensaver: pictures, the program (kiosk-saver.py) and its picture types
+SAVER_DIR="$PROFILE_DIR/saver"
+SAVER_BIN="${SEKTA_KIOSK_SAVER_BIN:-$HOME/.local/bin/sekta-kiosk-saver}"
+SAVER_EXT="png jpg jpeg webp bmp gif svg"
+SAVER_MAX_MB=50
+SAVER_SEKTA=sekta.png   # the built-in one: the SEKTA logo of the boot splash
+SEKTA_LOGOS=(/usr/share/sekta-kiosk/logo.png /usr/share/plymouth/themes/mylogo/logo.png
+  "$(dirname "$(readlink -f "$0")")/logo.png")
 GDM_CONF=/etc/gdm3/daemon.conf
 GDM_MARK="# sekta-kiosk: X11 for several screens"
 GDM_SAVED="#sekta-kiosk-was: "
@@ -101,27 +128,138 @@ GDM_SAVED="#sekta-kiosk-was: "
 profile_of() {
   if [ "$1" -eq 1 ]; then echo "$HOME/.config/chromium"; else echo "$PROFILE_DIR/chromium-$1"; fi
 }
-# Session files: Sessions/ since Chromium ~100, "Current/Last Session" before.
+# Session files: Sessions/ since Chromium ~100 (and Sessions_Encrypted/ since
+# ~150), "Current/Last Session" before.
 has_session() {
   compgen -G "$1/Default/Sessions/Session_*" >/dev/null \
+    || compgen -G "$1/Default/Sessions_Encrypted/Session_*" >/dev/null \
     || [ -f "$1/Default/Current Session" ] || [ -f "$1/Default/Last Session" ]
 }
 forget_sessions() {
   local n
   for n in 1 2 3; do
-    rm -rf "$(profile_of "$n")/Default/Sessions"
+    rm -rf "$(profile_of "$n")/Default/Sessions" "$(profile_of "$n")/Default/Sessions_Encrypted"
     rm -f "$(profile_of "$n")/Default/"{Current,Last}\ {Session,Tabs}
+  done
+}
+# Last address of each window of the newest saved session of profile $1, one
+# line per window in the order they were opened, at most $2 (http/https only,
+# else an empty line). The session file (SNSS) is a list of commands: 0 tab →
+# window, 2 tab's index in its window, 6 a tab's navigation entry (pickle:
+# tab, index, URL), 7 the tab's current entry, 8 the window's selected tab,
+# 9 window type (0 = normal), 16/17 tab/window closed.
+last_urls() {
+  local f
+  f="$(ls -t "$1"/Default/Sessions/Session_* 2>/dev/null | head -n 1)"
+  [ -n "$f" ] || return 0
+  python3 -I - "$f" "$2" <<'PY' 2>/dev/null || true
+import struct, sys
+d = open(sys.argv[1], "rb").read()
+if d[:4] != b"SNSS":
+    sys.exit()
+tab_win, tab_idx, nav, cur, sel, wtype, closed = {}, {}, {}, {}, {}, {}, set()
+p = 8
+while p + 3 <= len(d):
+    n, = struct.unpack_from("<H", d, p)
+    cid, b = d[p + 2], d[p + 3:p + 2 + n]
+    p += 2 + n
+    try:
+        if cid == 0:
+            w, t = struct.unpack_from("<ii", b); tab_win[t] = w
+        elif cid == 2:
+            t, i = struct.unpack_from("<ii", b); tab_idx[t] = i
+        elif cid == 6:
+            _, t, i, k = struct.unpack_from("<Iiii", b)
+            nav[(t, i)] = b[16:16 + k].decode("utf-8", "replace")
+        elif cid == 7:
+            t, i = struct.unpack_from("<ii", b); cur[t] = i
+        elif cid == 8:
+            w, i = struct.unpack_from("<ii", b); sel[w] = i
+        elif cid == 9:
+            w, k = struct.unpack_from("<ii", b); wtype[w] = k
+        elif cid == 16:
+            tab_win.pop(struct.unpack_from("<i", b)[0], None)
+        elif cid == 17:
+            closed.add(struct.unpack_from("<i", b)[0])
+    except struct.error:
+        pass
+wins = sorted({w for w in tab_win.values() if w not in closed and wtype.get(w, 0) == 0})
+for w in wins[:int(sys.argv[2])]:
+    tabs = sorted((tab_idx.get(t, 0), t) for t, x in tab_win.items() if x == w)
+    pick = [t for i, t in tabs if i == sel.get(w, 0)] or [t for _, t in tabs]
+    u = nav.get((pick[0], cur.get(pick[0], 0)), "")
+    print(u if u.startswith(("https://", "http://")) and "\n" not in u else "")
+PY
+}
+# Mark the last exit of a profile clean. After an "unclean" one (power cut,
+# a kill) Chromium waits for its "restore pages?" bubble — hidden by
+# --disable-session-crashed-bubble — and saves no session at all until it is
+# answered: the pages were then never remembered again.
+mark_clean() {
+  local f
+  for f in "$1/Default/Preferences" "$1/Local State"; do
+    [ -f "$f" ] || continue
+    grep -E '"exit_type":"[^N]|"exited_cleanly":false' "$f" >/dev/null 2>&1 || continue
+    sed -i -e 's/"exit_type":"[A-Za-z]*"/"exit_type":"Normal"/g' \
+      -e 's/"exited_cleanly":false/"exited_cleanly":true/g' "$f" 2>/dev/null || true
   done
 }
 
 # a screen zoom in percent: 50–300
 zoom_ok() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; (( $1 >= 50 && $1 <= 300 )); }
 
+# a screensaver picture name in SAVER_DIR (as --saver-add made it) or "-";
+# the SEKTA logo is put back if it went missing
+saver_ok() {
+  [ "$1" = - ] && return 0
+  case "$1" in */*|.*|'') return 1 ;; esac
+  [ "$1" = "$SAVER_SEKTA" ] && [ ! -f "$SAVER_DIR/$1" ] && saver_sekta >/dev/null
+  [ -f "$SAVER_DIR/$1" ]
+}
+
+# the SEKTA logo as SAVER_DIR/sekta.png: from $1, else the first logo found
+saver_sekta() {
+  local f
+  for f in "${1:-}" "${SEKTA_LOGOS[@]}"; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    mkdir -p "$SAVER_DIR" || return 1
+    if ! cmp -s "$f" "$SAVER_DIR/$SAVER_SEKTA"; then
+      cp "$f" "$SAVER_DIR/.$SAVER_SEKTA.tmp" && chmod 644 "$SAVER_DIR/.$SAVER_SEKTA.tmp" \
+        && mv -f "$SAVER_DIR/.$SAVER_SEKTA.tmp" "$SAVER_DIR/$SAVER_SEKTA" || return 1
+    fi
+    echo "$SAVER_SEKTA"; return 0
+  done
+  [ -f "$SAVER_DIR/$SAVER_SEKTA" ] && { echo "$SAVER_SEKTA"; return 0; }
+  log "no SEKTA logo (logo.png) found"; return 1
+}
+hours_ok() { case "$1" in [1-9]|1[0-2]) return 0 ;; *) return 1 ;; esac; }
+size_ok() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; (( $1 >= 10 && $1 <= 100 )); }
+
+# copy picture $1 into SAVER_DIR as <sha256 start>.<ext>, print that name
+saver_add() {
+  local f="$1" ext name
+  [ -f "$f" ] || { log "no file $f"; return 2; }
+  ext="$(printf '%s' "${f##*.}" | tr '[:upper:]' '[:lower:]')"
+  case " $SAVER_EXT " in *" $ext "*) ;; *) log "not a picture ($SAVER_EXT): $f"; return 2 ;; esac
+  [ "$ext" = jpeg ] && ext=jpg
+  if [ "$(stat -c %s "$f" 2>/dev/null || echo 0)" -gt $(( SAVER_MAX_MB * 1024 * 1024 )) ]; then
+    log "picture bigger than $SAVER_MAX_MB MB: $f"; return 2
+  fi
+  name="$(sha256sum < "$f" | cut -c1-16).$ext"   # never "sekta.png"
+  mkdir -p "$SAVER_DIR" || return 1
+  if [ ! -f "$SAVER_DIR/$name" ]; then
+    cp "$f" "$SAVER_DIR/.$name.tmp" && chmod 644 "$SAVER_DIR/.$name.tmp" \
+      && mv -f "$SAVER_DIR/.$name.tmp" "$SAVER_DIR/$name" || { rm -f "$SAVER_DIR/.$name.tmp"; return 1; }
+  fi
+  echo "$name"
+}
+
 # shell-quoted words, nothing for an empty list
 q_words() { local a; for a in "$@"; do printf '%q ' "$a"; done; }
 
 write_conf() {
-  SCREENS=1; URLS=(); LAYOUT=(); OUTPUTS=(); SCALES=(); CHROMIUM=""; CHROMIUM_FLAGS=(); RESTORE=auto
+  SCREENS=1; URLS=(); LAYOUT=(); OUTPUTS=(); SCALES=(); SAVERS=(); SAVER_HOURS=(); SAVER_SIZES=()
+  CHROMIUM=""; CHROMIUM_FLAGS=(); RESTORE=auto
   # shellcheck source=/dev/null
   [ -f "$CONF" ] && . "$CONF"
   [ -n "${KIOSK_SCREENS:-}" ] && SCREENS="$KIOSK_SCREENS"
@@ -129,6 +267,9 @@ write_conf() {
   [ -n "${KIOSK_LAYOUT+x}" ] && read -r -a LAYOUT <<< "$KIOSK_LAYOUT"
   [ -n "${KIOSK_OUTPUTS+x}" ] && read -r -a OUTPUTS <<< "$KIOSK_OUTPUTS"
   [ -n "${KIOSK_SCALE+x}" ] && read -r -a SCALES <<< "$KIOSK_SCALE"
+  [ -n "${KIOSK_SAVER+x}" ] && read -r -a SAVERS <<< "$KIOSK_SAVER"
+  [ -n "${KIOSK_SAVER_HOURS+x}" ] && read -r -a SAVER_HOURS <<< "$KIOSK_SAVER_HOURS"
+  [ -n "${KIOSK_SAVER_SIZE+x}" ] && read -r -a SAVER_SIZES <<< "$KIOSK_SAVER_SIZE"
   [ -n "${KIOSK_CHROMIUM:-}" ] && CHROMIUM="$KIOSK_CHROMIUM"
   [ -n "${KIOSK_RESTORE:-}" ] && RESTORE="$KIOSK_RESTORE"
 
@@ -155,6 +296,21 @@ write_conf() {
   for sc in "${SCALES[@]}"; do
     zoom_ok "$sc" || { log "screen zoom must be a percent 50-300 (got '$sc')"; return 2; }
   done
+  while [ "${#SAVERS[@]}" -lt "$SCREENS" ]; do SAVERS+=(-); done
+  SAVERS=("${SAVERS[@]:0:$SCREENS}")
+  while [ "${#SAVER_HOURS[@]}" -lt "$SCREENS" ]; do SAVER_HOURS+=(1); done
+  SAVER_HOURS=("${SAVER_HOURS[@]:0:$SCREENS}")
+  while [ "${#SAVER_SIZES[@]}" -lt "$SCREENS" ]; do SAVER_SIZES+=(50); done
+  SAVER_SIZES=("${SAVER_SIZES[@]:0:$SCREENS}")
+  for sc in "${SAVERS[@]}"; do
+    saver_ok "$sc" || { log "no screensaver picture '$sc' in $SAVER_DIR"; return 2; }
+  done
+  for sc in "${SAVER_HOURS[@]}"; do
+    hours_ok "$sc" || { log "screensaver hours must be 1-12 (got '$sc')"; return 2; }
+  done
+  for sc in "${SAVER_SIZES[@]}"; do
+    size_ok "$sc" || { log "screensaver picture size must be 10-100 % (got '$sc')"; return 2; }
+  done
   local seen=" " o
   for o in "${OUTPUTS[@]}"; do
     [ "$o" = - ] && continue
@@ -173,10 +329,21 @@ write_conf() {
     printf 'LAYOUT=(%s)\n' "${LAYOUT[*]}"
     printf 'OUTPUTS=(%s)\n' "$(q_words "${OUTPUTS[@]}")"
     printf 'SCALES=(%s)   # zoom of each screen, %%\n' "${SCALES[*]}"
+    printf 'SAVERS=(%s)   # screensaver picture of each screen in saver/, - = none\n' "$(q_words "${SAVERS[@]}")"
+    printf 'SAVER_HOURS=(%s)   # idle hours before it\n' "${SAVER_HOURS[*]}"
+    printf 'SAVER_SIZES=(%s)   # picture size, %% of the screen\n' "${SAVER_SIZES[*]}"
     printf 'CHROMIUM=%q\n' "$CHROMIUM"
     printf 'CHROMIUM_FLAGS=(%s)\n' "$(q_words "${CHROMIUM_FLAGS[@]}")"
     echo "RESTORE=$RESTORE   # reopen pages after a reboot: auto = on several screens, 1 = always, 0 = never"
-  } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+  } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF" || return 1
+  # pictures no screen uses any more (also ones picked and then cancelled);
+  # the SEKTA logo stays
+  local f
+  for f in "$SAVER_DIR"/* "$SAVER_DIR"/.*.tmp; do
+    [ -f "$f" ] && [ "${f##*/}" != "$SAVER_SEKTA" ] || continue
+    case " ${SAVERS[*]} " in *" ${f##*/} "*) ;; *) rm -f "$f" ;; esac
+  done
+  return 0
 }
 
 gdm_x11() {
@@ -209,6 +376,10 @@ case "${1:-}" in
     exit 0 ;;
   --write-conf)
     write_conf; exit $? ;;
+  --saver-add)
+    saver_add "${2:-}"; exit $? ;;
+  --saver-sekta)
+    saver_sekta "${2:-}"; exit $? ;;
   --gdm)
     [ "$(id -u)" -eq 0 ] || { log "--gdm needs root"; exit 1; }
     case "${2:-}" in
@@ -230,7 +401,9 @@ case "${1:-}" in
       echo "gnome-shell: ${v1:--}  chromium: ${v2:--}  window manager: ${v3:--}"
       echo "gdm: $(bash "$0" --gdm-status 2>/dev/null)"
       grep -nE 'WaylandEnable|sekta-kiosk' "$GDM_CONF" 2>/dev/null | sed 's/^/  /'
-      echo "kiosk: $(systemctl --user is-active chromium-kiosk.service 2>/dev/null)"
+      echo "kiosk: $(systemctl --user is-active chromium-kiosk.service 2>/dev/null)" \
+        "screensaver: $(pgrep -u "$(id -u)" -f "$SAVER_BIN" >/dev/null 2>&1 && echo running || echo -)"
+      ls -l "$SAVER_DIR" 2>/dev/null | sed 1d | sed 's/^/  saver\//'
       echo; echo "== $CONF"; grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null | grep -v '^CHROMIUM_FLAGS' | sed 's/^/  /'
       echo; echo "== last start (zoom: computed -> xrandr -> what stayed)"
       cat "$DIAG_FILE" 2>/dev/null || echo "  (no start since boot)"
@@ -257,7 +430,8 @@ case "${1:-}" in
   *) log "unknown option $1"; exit 2 ;;
 esac
 
-SCREENS=1; URLS=(); LAYOUT=(); OUTPUTS=(); SCALES=(); CHROMIUM=chromium; CHROMIUM_FLAGS=(); RESTORE=auto
+SCREENS=1; URLS=(); LAYOUT=(); OUTPUTS=(); SCALES=(); SAVERS=(); SAVER_HOURS=(); SAVER_SIZES=()
+CHROMIUM=chromium; CHROMIUM_FLAGS=(); RESTORE=auto
 if [ "${1:-}" != --outputs ]; then
   [ -f "$CONF" ] || { log "no config $CONF"; exit 1; }
   # shellcheck source=/dev/null
@@ -268,6 +442,49 @@ fi
 if [ "$RESTORE" = auto ]; then
   if [ "$SCREENS" -gt 1 ]; then RESTORE=1; else RESTORE=0; fi
 fi
+
+# --- screensaver -------------------------------------------------------------
+# kiosk-saver.py watches the idle time (no mouse / keyboard) and covers a
+# screen with black + its picture after that screen's hours. Started with the
+# kiosk, out of its job table (not a kiosk window for `wait -n`); a restart of
+# the unit ends it with the rest of the unit and starts it again.
+# $@ = output per screen ("-" = any / every monitor); SAVERS / SAVER_HOURS /
+# SAVER_SIZES per screen in the same order.
+start_saver() {
+  local args=() i o
+  pkill -u "$(id -u)" -f "$SAVER_BIN" 2>/dev/null
+  for ((i = 0; i < $#; i++)); do
+    o="${SAVERS[$i]:--}"
+    [ "$o" != - ] && [ -f "$SAVER_DIR/$o" ] || continue
+    args+=("${@:$((i + 1)):1}" "${SAVER_HOURS[$i]:-1}" "${SAVER_SIZES[$i]:-50}" "$SAVER_DIR/$o")
+  done
+  [ "${#args[@]}" -gt 0 ] || return 0
+  if [ ! -f "$SAVER_BIN" ]; then log "screensaver set, but $SAVER_BIN is missing"; return 0; fi
+  log "screensaver: ${args[*]}"
+  python3 "$SAVER_BIN" "${args[@]}" </dev/null &
+  disown "$!" 2>/dev/null || true
+}
+
+# GNOME (40+) opens the Activities overview right after login: the kiosk
+# windows sat there as thumbnails (the page "not open", not full screen) until
+# a click. For the first minute after the kiosk starts, close it whenever it is
+# on; later a hand-opened overview stays. Disowned like the screensaver.
+leave_overview() {
+  command -v gdbus >/dev/null 2>&1 || return 0
+  (
+    shell() {
+      gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
+        --method "org.freedesktop.DBus.Properties.$1" org.gnome.Shell OverviewActive "${@:2}" 2>/dev/null
+    }
+    for _ in $(seq 1 60); do
+      if [ "$(shell Get)" = "(<true>,)" ]; then
+        shell Set "<false>" >/dev/null && log "GNOME overview closed"
+      fi
+      sleep 1
+    done
+  ) </dev/null >/dev/null &
+  disown "$!" 2>/dev/null || true
+}
 
 # --- one screen: the plain kiosk ---------------------------------------------
 # No layout to arrange. One site → locked --kiosk; several → tabs in a
@@ -290,7 +507,10 @@ restore_scales() {
 if [ "$SCREENS" -le 1 ] && [ "${1:-}" != --outputs ]; then
   rm -f "$MAP_FILE"
   restore_scales   # was several screens with a zoom
+  start_saver "${OUTPUTS[0]:--}"
+  leave_overview
   if [ "${#URLS[@]}" -gt 1 ]; then win=(--start-maximized); else win=(--kiosk); fi
+  mark_clean "$(profile_of 1)"
   if [ "$RESTORE" = 1 ] && has_session "$(profile_of 1)"; then
     open=(--restore-last-session); log "restoring the pages from last time"
   else
@@ -429,15 +649,17 @@ for ((i = 0; i < SCREENS; i++)); do
 done
 # A screen left without a monitor is skipped; the others keep their sites and
 # hours (a skipped screen 1 → the next one becomes the centre).
-urls=(); layout=(); scales=()
+urls=(); layout=(); scales=(); savers=(); shours=(); ssizes=()
 for ((i = 0; i < SCREENS; i++)); do
   if [ -z "${SCREEN_OUT[$i]:-}" ]; then log "screen $((i + 1)): no monitor for it — skipped"; continue; fi
   NAMES+=("${SCREEN_OUT[$i]}")
   urls+=("${URLS[$i]:-${URLS[0]:-}}")
   scales+=("${SCALES[$i]:-100}")
+  savers+=("${SAVERS[$i]:--}"); shours+=("${SAVER_HOURS[$i]:-1}"); ssizes+=("${SAVER_SIZES[$i]:-50}")
   [ "${#NAMES[@]}" -gt 1 ] && layout+=("${LAYOUT[$((i - 1))]:-3}")
 done
 URLS=("${urls[@]}"); LAYOUT=("${layout[@]}"); SCALES=("${scales[@]}")
+SAVERS=("${savers[@]}"); SAVER_HOURS=("${shours[@]}"); SAVER_SIZES=("${ssizes[@]}")
 SCREENS="${#NAMES[@]}"
 NAMES+=("${free[@]}")   # outputs left over: moved aside below
 [ "$SCREENS" -gt 0 ] || { log "no monitor for any screen"; exit 1; }
@@ -606,6 +828,9 @@ if [ "${#mons[@]}" -gt 0 ]; then
   done
 fi
 
+start_saver "${NAMES[@]:0:$SCREENS}"
+leave_overview
+
 # --- Chromium windows --------------------------------------------------------
 # Under Wayland run Chromium through XWayland — native Wayland windows can't
 # choose their screen.
@@ -650,27 +875,31 @@ if [ -n "$SHARED" ]; then
     wmctrl -i -r "$1" -b add,fullscreen
   }
 
-  if [ "$RESTORE" = 1 ] && has_session "$(profile_of 1)"; then
-    open=(--restore-last-session); log "restoring the pages from last time"
-  else
-    open=("$(url_of 0)")
-  fi
   # The kiosk owns this profile: a Chromium already running on it (a browser
   # opened by hand, a kiosk not stopped yet) would take our start over its
   # singleton and exit at once — the watch below would then restart forever.
   # (comm is cut to 15 chars: chromium-browser → chromium-browse on RPi OS)
   if pgrep -u "$(id -u)" -x 'chromium|chromium-browse' >/dev/null 2>&1; then
     log "Chromium already running for $(id -un) — closing it first"
-    pkill -u "$(id -u)" -x 'chromium|chromium-browse'
+    # the browser process (the oldest) only: it closes its own renderers and
+    # exits cleanly — TERM to all of them at once is an "unclean" exit
+    pkill -o -u "$(id -u)" -x 'chromium|chromium-browse'
     for _ in $(seq 1 20); do pgrep -u "$(id -u)" -x 'chromium|chromium-browse' >/dev/null 2>&1 || break; sleep 0.5; done
   fi
+  # after the one above is gone: it may still write its exit state
+  mark_clean "$(profile_of 1)"
+  LAST=()
+  if [ "$RESTORE" = 1 ]; then
+    mapfile -t LAST < <(last_urls "$(profile_of 1)" "$SCREENS")
+    [ "${#LAST[@]}" -gt 0 ] && log "pages from last time: ${LAST[*]}"
+  fi
+  # this screen's address from last time, else its site
+  site_of() { echo "${LAST[$1]:-$(url_of "$1")}"; }
   "$CHROMIUM" "${extra[@]}" --kiosk \
     --window-position="${X[0]},${Y[0]}" --window-size="${W[0]},${H[0]}" \
-    "${CHROMIUM_FLAGS[@]}" "${open[@]}" &
+    "${CHROMIUM_FLAGS[@]}" "$(site_of 0)" &
   PIDS+=("$!")
   wait_windows 1 60 || { log "Chromium opened no window"; stop_all; exit 1; }
-  # a restored session brings its windows one by one — give them time
-  [ "${open[0]}" = --restore-last-session ] && wait_windows "$SCREENS" 15
 
   # Windows already open (restored) go to the nearest screen; screens left
   # without one get a new window with their site.
@@ -693,13 +922,13 @@ if [ -n "$SHARED" ]; then
       continue
     fi
     before=" $(windows | awk '{ print $1 }' | tr '\n' ' ') "
-    timeout 20 "$CHROMIUM" "${extra[@]}" "${CHROMIUM_FLAGS[@]}" --new-window "$(url_of "$i")" >/dev/null 2>&1
+    timeout 20 "$CHROMIUM" "${extra[@]}" "${CHROMIUM_FLAGS[@]}" --new-window "$(site_of "$i")" >/dev/null 2>&1
     if wait_windows $(( $(wc -w <<< "$before") + 1 )) 30; then
       # the new window = the id that was not there before
       for id in $(windows | awk '{ print $1 }'); do
         case "$before" in *" $id "*) ;; *) ASSIGNED[$i]="$id" ;; esac
       done
-      log "screen $((i + 1)): $(where "$i") → $(url_of "$i")"
+      log "screen $((i + 1)): $(where "$i") → $(site_of "$i")"
     else
       log "screen $((i + 1)): no new window appeared"
     fi
@@ -735,20 +964,19 @@ fi
 # default profile (logins from a single-screen kiosk stay).
 for ((i = 0; i < SCREENS; i++)); do
   dir="$(profile_of $((i + 1)))"
+  mark_clean "$dir"
   prof=()
   if (( i > 0 )); then
     mkdir -p "$dir"
     prof=(--user-data-dir="$dir")
   fi
-  if [ "$RESTORE" = 1 ] && has_session "$dir"; then
-    open=(--restore-last-session); what="pages from last time"
-  else
-    open=("$(url_of "$i")"); what="${open[0]}"
-  fi
-  log "screen $((i + 1)): $(where "$i") → $what"
+  site=""
+  [ "$RESTORE" = 1 ] && site="$(last_urls "$dir" 1)"
+  site="${site:-$(url_of "$i")}"
+  log "screen $((i + 1)): $(where "$i") → $site"
   "$CHROMIUM" "${prof[@]}" "${extra[@]}" --kiosk \
     --window-position="${X[$i]},${Y[$i]}" --window-size="${W[$i]},${H[$i]}" \
-    "${CHROMIUM_FLAGS[@]}" "${open[@]}" &
+    "${CHROMIUM_FLAGS[@]}" "$site" &
   PIDS+=("$!")
 done
 
