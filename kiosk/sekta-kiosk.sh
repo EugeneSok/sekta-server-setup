@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# sekta-kiosk — the SEKTA kiosk display app (zenity windows, Ukrainian UI).
+# sekta-kiosk — the SEKTA kiosk display app (Ukrainian UI).
+#
+# The window is sekta-kiosk-gui.py (Python + GTK 4: screens as they stand,
+# zoom, update, installer); without python3-gi / GTK 4 (or with
+# SEKTA_KIOSK_ZENITY=1) this script shows the same in zenity windows.
 #
 # On a display with the kiosk installed (~/.local/bin/sekta-kiosk; menu entry
 # «Sekta kiosk — екрани»; Ctrl+Alt+K, also over the full-screen kiosk):
@@ -25,6 +29,7 @@
 set -u
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ARGS=("$@")
 HERE="$(dirname "$SELF")"
 APP_BIN="$HOME/.local/bin/sekta-kiosk"
 SCREENS_BIN="$HOME/.local/bin/sekta-kiosk-screens"
@@ -132,9 +137,29 @@ sudo_hint() {
     "потім вийти з сеансу й увійти знову (або перезавантажити) і запустити Sekta kiosk ще раз."
 }
 
-# No zenity yet (a bare Debian): install the bundled packages in a terminal —
-# sudo asks the password there — then go on in windows.
-if ! command -v zenity >/dev/null 2>&1 && [ -n "$INSTALL_SRC" ]; then
+# The GTK window: next to this script (stick / package: .py, ~/.local/bin:
+# sekta-kiosk-gui), with python3-gi and GTK 4 there.
+GUI=""
+for g in "$HERE/sekta-kiosk-gui.py" "$HERE/sekta-kiosk-gui"; do
+  if [ -f "$g" ]; then GUI="$g"; break; fi
+done
+gui_check() {
+  [ -n "$GUI" ] && [ -z "${SEKTA_KIOSK_ZENITY:-}" ] && command -v python3 >/dev/null 2>&1 \
+    && python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("PangoCairo", "1.0"); gi.require_foreign("cairo"); from gi.repository import Gtk, PangoCairo' >/dev/null 2>&1
+}
+GUI_OK=""; if gui_check; then GUI_OK=1; fi   # once: a python + GTK load costs
+gui_ok() { [ -n "$GUI_OK" ]; }
+
+# one window at a time — a second Ctrl+Alt+K does nothing (also not a second
+# package install in a terminal; the GTK window keeps the lock: fd 9 goes
+# with exec)
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/sekta-kiosk.lock"
+flock -n 9 || exit 0
+
+# No window toolkit yet (a bare Debian): install the bundled packages in a
+# terminal — sudo asks the password there — then go on in windows. (zenity
+# there but not GTK 4: offer_gtk asks in a zenity window, above the kiosk.)
+if [ -n "$INSTALL_SRC" ] && ! gui_ok && ! command -v zenity >/dev/null 2>&1; then
   boot_dir="$(mktemp -d)"
   {
     echo "echo \$\$ > '$boot_dir/pid'"
@@ -173,18 +198,20 @@ if ! command -v zenity >/dev/null 2>&1 && [ -n "$INSTALL_SRC" ]; then
     fi
   fi
   rm -rf "$boot_dir"
+  if gui_check; then GUI_OK=1; fi
 fi
+[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || { echo "sekta-kiosk: потрібен графічний сеанс." >&2; exit 1; }
+
+if gui_ok; then
+  SEKTA_KIOSK_SRC="$INSTALL_SRC" SEKTA_KIOSK_SELF="$SELF" exec python3 "$GUI" "$@"
+fi
+
 if ! command -v zenity >/dev/null 2>&1; then
-  echo "sekta-kiosk: потрібен zenity (sudo apt install zenity)." >&2
+  echo "sekta-kiosk: потрібен python3-gi з GTK 4 або zenity (sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0)." >&2
   [ -n "$INSTALL_SRC" ] && \
     echo "Без нього можна встановити в терміналі: bash $INSTALL_SRC/install-offline.sh" >&2
   exit 1
 fi
-[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || { echo "sekta-kiosk: потрібен графічний сеанс." >&2; exit 1; }
-
-# one window at a time — a second Ctrl+Alt+K does nothing
-exec 9>"${XDG_RUNTIME_DIR:-/tmp}/sekta-kiosk.lock"
-flock -n 9 || exit 0
 
 z() { zenity --title="$TITLE" "$@" 2>/dev/null; }
 info_box() { z --info --width=460 --text="$1"; }
@@ -223,6 +250,15 @@ load_conf() {
   fi
   for ((i = 1; i < N; i++)); do S_HOUR+=("${LAYOUT[$((i - 1))]:-3}"); done
   for ((i = 0; i < N; i++)); do S_OUT+=("${OUTPUTS[$i]:--}"); S_SCALE+=("${SCALES[$i]:-100}"); done
+  LOADED_KEY="$(state_key)"
+}
+
+# screens, sites, layout, outputs of the editor state — what makes the
+# remembered pages wrong (zoom does not); normalised like --write-conf writes
+# them, so a conf with OUTPUTS=() equals its "- -" rewrite
+state_key() {
+  export_settings   # the very values --write-conf gets
+  printf '%s' "$KIOSK_SCREENS|$KIOSK_URL|$KIOSK_LAYOUT|$KIOSK_OUTPUTS" | tr -s ' '
 }
 
 # Connected outputs (X11 names). On Wayland only XWAYLANDn is visible — then
@@ -418,7 +454,7 @@ sudo bash $SCREENS_BIN $*"
 
 apply_screens() {
   local before after err reboot="" gdm
-  before="$SCREENS|${URLS[*]}|${LAYOUT[*]}|${OUTPUTS[*]}"
+  before="$LOADED_KEY"
   export_settings
   ks_stop
   if ! err="$("$SCREENS_BIN" --write-conf 2>&1)"; then
@@ -427,7 +463,7 @@ apply_screens() {
     return
   fi
   load_conf
-  after="$SCREENS|${URLS[*]}|${LAYOUT[*]}|${OUTPUTS[*]}"
+  after="$LOADED_KEY"
   # Any change of screens or sites: forget the remembered pages — restored
   # windows go to the nearest screen, after a new layout that is the wrong one.
   # (The kiosk is stopped: Chromium would save its session again on exit.)
@@ -508,7 +544,7 @@ main_menu() {
       --text="Екранів: $N. Kiosk $st.
 Що зробити?" --column="Дія" \
       "Екрани й сайти" "Визначити екрани" "Повернути задані сайти" "Перезапустити kiosk" "$toggle" \
-      ${INSTALL_SRC:+"Перевстановити kiosk ($(src_version))"})" || exit 0
+      "Оновити з файлу (.deb)" ${INSTALL_SRC:+"Перевстановити kiosk ($(src_version))"})" || exit 0
     case "$c" in
       "Екрани й сайти")
         detect_outputs
@@ -520,10 +556,93 @@ main_menu() {
         fi ;;
       "Перезапустити kiosk") ks_stop; ks_start ;;
       "Перевстановити kiosk"*) install_from_src ;;
+      "Оновити з файлу (.deb)") update_from_deb ;;
       "Зупинити kiosk") ks_stop ;;
       "Запустити kiosk") ks_start ;;
     esac
   done
+}
+
+# A dir with `sudo` (= sudo -A) and its askpass — a zenity password window;
+# put first in PATH, sudo of the scripts run there asks in a window.
+sudo_window_dir() {
+  local t
+  t="$(mktemp -d)"
+  printf '#!/bin/sh\nexec /usr/bin/sudo -A "$@"\n' > "$t/sudo"
+  printf '#!/bin/sh\nexec zenity --password --title="%s — пароль адміністратора" 2>/dev/null\n' "$TITLE" > "$t/askpass"
+  chmod 755 "$t/sudo" "$t/askpass"
+  echo "$t"
+}
+
+# --- update from a .deb (e.g. on a stick) ------------------------------------
+# Pick sekta-kiosk_<ver>+<release>_<arch>.deb, install the package, then update
+# the kiosk with the app and installer that came in it (screens, sites and
+# pages stay).
+update_from_deb() {
+  local start f pkg arch ver rel cur myarch myrel extra=() t rc tmp
+  start="$HOME"
+  [ -d "/media/$USER" ] && start="/media/$USER"
+  f="$(z --file-selection --title="$TITLE — пакет sekta-kiosk (.deb)" --filename="$start/" \
+    --file-filter="Пакет sekta-kiosk | sekta-kiosk*.deb" --file-filter="Усі .deb | *.deb")" || return 0
+  [ -f "$f" ] || return 0
+  pkg="$(dpkg-deb -f "$f" Package 2>/dev/null)"
+  if [ "$pkg" != sekta-kiosk ]; then
+    err_box "$(esc "$(basename "$f")") — не пакет sekta-kiosk${pkg:+ (це $pkg)}."
+    return 0
+  fi
+  arch="$(dpkg-deb -f "$f" Architecture)"; ver="$(dpkg-deb -f "$f" Version)"
+  myarch="$(dpkg --print-architecture)"
+  myrel="$( . /etc/os-release; echo "${VERSION_CODENAME:-}")"
+  rel="${ver##*+}"
+  if [ "$arch" != "$myarch" ] && [ "$arch" != all ]; then
+    err_box "Пакет для $arch, а ця машина — $myarch. Потрібен sekta-kiosk_…+${myrel}_$myarch.deb."
+    return 0
+  fi
+  if [ "$rel" != "$ver" ] && [ -n "$myrel" ] && [ "$rel" != "$myrel" ]; then
+    err_box "Пакет для Debian «$rel», а ця машина — «$myrel». Потрібен sekta-kiosk_…+${myrel}_$myarch.deb."
+    return 0
+  fi
+  if ! has_sudo; then err_box "$(esc "$(sudo_hint)")"; return 0; fi
+
+  cur="$(dpkg-query -W -f='${Version}' sekta-kiosk 2>/dev/null || true)"
+  if [ -n "$cur" ] && dpkg --compare-versions "$ver" eq "$cur"; then
+    ask "Версія ${ver%%+*} вже встановлена. Встановити її ще раз і перевстановити kiosk?" \
+      --ok-label="Перевстановити" --cancel-label="Скасувати" || return 0
+    extra=(--reinstall)
+  elif [ -n "$cur" ] && dpkg --compare-versions "$ver" lt "$cur"; then
+    ask "Це старіша версія (${ver%%+*}), ніж встановлена (${cur%%+*}). Встановити все одно?" \
+      --ok-label="Встановити" --cancel-label="Скасувати" || return 0
+    extra=(--allow-downgrades)
+  else
+    ask "Оновити до версії ${ver%%+*}${cur:+ (встановлено ${cur%%+*})}?
+Екрани, сайти й відкриті сторінки лишаться як є." --ok-label="Оновити" --cancel-label="Скасувати" || return 0
+  fi
+
+  # a copy apt's sandbox user can read (a stick is mounted for $USER only)
+  tmp="$(mktemp -d)"; chmod 755 "$tmp"
+  t="$(sudo_window_dir)"
+  rc=0
+  {
+    echo "Копіювання $(basename "$f")…"
+    cp "$f" "$tmp/sekta-kiosk.deb" && chmod 644 "$tmp/sekta-kiosk.deb" || exit 1
+    echo "Встановлення пакета…"
+    PATH="$t:$PATH" SUDO_ASKPASS="$t/askpass" sudo env DEBIAN_FRONTEND=noninteractive \
+      apt-get install -y "${extra[@]}" "$tmp/sekta-kiosk.deb" </dev/null
+  } > "$LOG_FILE" 2>&1 &
+  local pid=$!
+  ( while kill -0 "$pid" 2>/dev/null; do tail -n 1 "$LOG_FILE" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/^/# /'; sleep 1; done ) \
+    | z --progress --pulsate --auto-close --no-cancel --width=640 --text="Встановлення пакета…"
+  wait "$pid" || rc=$?
+  rm -rf "$t" "$tmp"
+  if [ "$rc" -ne 0 ]; then
+    z --text-info --width=860 --height=520 --filename="$LOG_FILE" \
+      --title="$TITLE — пакет не встановлено (журнал: $LOG_FILE)"
+    return 0
+  fi
+  # the kiosk itself: with the package's own (new) app and installer — exec,
+  # also when this is the package's app: its file on disk is the new one now
+  if [ -n "$ONTOP_PID" ]; then kill "$ONTOP_PID" 2>/dev/null; fi
+  exec bash "$PKG_DIR/sekta-kiosk.sh" --install
 }
 
 # --- installer (from the stick) ----------------------------------------------
@@ -538,7 +657,7 @@ installer() {
 
   if ! has_sudo; then err_box "$(esc "$(sudo_hint)")"; return 1; fi
   load_conf   # a reinstall starts from this machine's current settings
-  before="$SCREENS|${URLS[*]}|${LAYOUT[*]}|${OUTPUTS[*]}"
+  before="$LOADED_KEY"
   detect_outputs
   info_box "Встановлення kiosk-дисплея SEKTA без інтернету ($bn, версія $(src_version)).
 
@@ -547,8 +666,8 @@ installer() {
   export_settings
   # same screens and sites: keep the remembered pages; an installed kiosk is
   # overwritten in place, not torn down under the running session
-  after="$N|${KIOSK_URL}|${KIOSK_LAYOUT}|${KIOSK_OUTPUTS}"
-  if installed && [ "$(printf '%s' "$before" | tr -s ' ')" = "$(printf '%s' "$after" | tr -s ' ')" ]; then
+  after="$(state_key)"
+  if installed && [ "$before" = "$after" ]; then
     export KIOSK_KEEP_PAGES=1
   else
     unset KIOSK_KEEP_PAGES
@@ -557,10 +676,7 @@ installer() {
 
   # sudo inside install-offline.sh asks for the password in a window
   local t rc
-  t="$(mktemp -d)"
-  printf '#!/bin/sh\nexec /usr/bin/sudo -A "$@"\n' > "$t/sudo"
-  printf '#!/bin/sh\nexec zenity --password --title="%s — пароль адміністратора" 2>/dev/null\n' "$TITLE" > "$t/askpass"
-  chmod 755 "$t/sudo" "$t/askpass"
+  t="$(sudo_window_dir)"
   ( cd "$INSTALL_SRC" && PATH="$t:$PATH" SUDO_ASKPASS="$t/askpass" bash ./install-offline.sh </dev/null ) 2>&1 \
     | tee "$LOG_FILE" \
     | sed -u 's/\x1b\[[0-9;]*m//g; s/^/# /' \
@@ -594,6 +710,38 @@ install_from_src() {
   fi
   installer
 }
+
+# zenity, no GTK 4 yet (e.g. a 1.2.0 kiosk got this package): offer the
+# bundle's packages for the new window — in a zenity window (above the
+# kiosk, password in a window). Declined or failed: asked again only with
+# another package version.
+GTK_TRIED="$HOME/.config/sekta-kiosk/gtk-offered"
+offer_gtk() {
+  local t rc
+  [ -n "$INSTALL_SRC" ] && [ -n "$GUI" ] && [ -z "${SEKTA_KIOSK_ZENITY:-}" ] || return 0
+  ls "$INSTALL_SRC/debs/$BUNDLE_NAME"/python3-gi-cairo_*.deb >/dev/null 2>&1 || return 0
+  [ "$(cat "$GTK_TRIED" 2>/dev/null)" != "$(src_version)" ] || return 0
+  has_sudo || return 0
+  mkdir -p "$(dirname "$GTK_TRIED")"
+  if ! ask "Для нового вікна Sekta kiosk потрібні пакети з набору (GTK 4, без інтернету).
+Встановити зараз? Kiosk працюватиме далі." --ok-label="Встановити" --cancel-label="Пізніше"; then
+    src_version > "$GTK_TRIED"; return 0
+  fi
+  t="$(sudo_window_dir)"
+  ( PATH="$t:$PATH" SUDO_ASKPASS="$t/askpass" bash "$INSTALL_SRC/install-offline.sh" --packages-only </dev/null ) 2>&1 \
+    | tee "$LOG_FILE" | sed -u 's/\x1b\[[0-9;]*m//g; s/^/# /' \
+    | z --progress --pulsate --auto-close --no-cancel --width=640 --text="Встановлення пакетів…"
+  rc="${PIPESTATUS[0]}"
+  rm -rf "$t"
+  if [ "$rc" -eq 0 ] && gui_check; then
+    # the new window: start over (its exec reopens the lock)
+    if [ -n "$ONTOP_PID" ]; then kill "$ONTOP_PID" 2>/dev/null; fi
+    exec bash "$SELF" "${ARGS[@]}"
+  fi
+  src_version > "$GTK_TRIED"
+  err_box "Пакети для нового вікна не встановлено (журнал: $LOG_FILE). Лишаються ці вікна."
+}
+offer_gtk
 
 if [ "${1:-}" = "--install" ] && [ -n "$INSTALL_SRC" ]; then
   installer

@@ -67,6 +67,7 @@ SCREENS_BIN="$HOME/.local/bin/sekta-kiosk-screens"
 SCREENS_CONF="$HOME/.config/sekta-kiosk/screens.conf"
 # sekta-kiosk app (kiosk/sekta-kiosk.sh): screens & sites later, menu + Ctrl+Alt+K
 APP_BIN="$HOME/.local/bin/sekta-kiosk"
+GUI_BIN="$HOME/.local/bin/sekta-kiosk-gui"   # its GTK window (kiosk/sekta-kiosk-gui.py)
 
 info()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -239,7 +240,7 @@ if detect_existing; then
     systemctl --user daemon-reload 2>/dev/null || true
     # Session autostart hooks (rewritten below for the chosen flavour).
     if [ -x "$APP_BIN" ]; then "$APP_BIN" --unintegrate 2>/dev/null || true; fi
-    rm -f "$LAUNCHER" "$XDG_AUTOSTART" "$SCREENS_BIN" "$SCREENS_CONF" "$APP_BIN"
+    rm -f "$LAUNCHER" "$XDG_AUTOSTART" "$SCREENS_BIN" "$SCREENS_CONF" "$APP_BIN" "$GUI_BIN"
     [ -f "$LABWC_AUTOSTART" ] && sed -i "/$AUTOSTART_MARK\$/d" "$LABWC_AUTOSTART"
 
     # Drop the old Plymouth theme dir.
@@ -427,10 +428,11 @@ else
   # wmctrl: windows of one shared Chromium on their screens (X11); wlr-randr:
   # screen layout on labwc/wayfire. Also for one screen — the sekta-kiosk app
   # can add screens later.
-  # zenity + pkexec: the sekta-kiosk app (windows, GDM Wayland/Xorg switch).
-  # One apt run for what this release has.
+  # python3-gi + GTK 4: the sekta-kiosk app's window; zenity: its fallback
+  # windows; pkexec: GDM Wayland/Xorg switch. One apt run for what this
+  # release has.
   extra_pkgs=()
-  for pkg in wmctrl wlr-randr zenity pkexec; do
+  for pkg in wmctrl wlr-randr python3-gi python3-gi-cairo gir1.2-gtk-4.0 zenity pkexec; do
     if apt-cache show "$pkg" >/dev/null 2>&1; then extra_pkgs+=("$pkg"); fi
   done
   if [ "${#extra_pkgs[@]}" -gt 0 ]; then
@@ -451,6 +453,12 @@ else
   chmod 755 "$SCREENS_BIN.new" "$APP_BIN.new"
   mv -f "$SCREENS_BIN.new" "$SCREENS_BIN"
   mv -f "$APP_BIN.new" "$APP_BIN"
+  # the GTK window: without it the app shows zenity windows
+  if get_asset sekta-kiosk-gui.py "$GUI_BIN.new"; then
+    chmod 755 "$GUI_BIN.new"; mv -f "$GUI_BIN.new" "$GUI_BIN"
+  else
+    rm -f "$GUI_BIN.new" "$GUI_BIN"; warn "Could not fetch sekta-kiosk-gui.py — the sekta-kiosk app uses zenity windows."
+  fi
   KIOSK_SCREENS="$SCREENS" KIOSK_URL="${URLS[*]}" KIOSK_LAYOUT="${LAYOUT[*]}" \
     KIOSK_OUTPUTS="${OUTPUTS[*]}" KIOSK_CHROMIUM="$CHROMIUM_BIN" \
     "$SCREENS_BIN" --write-conf || die "Could not write $SCREENS_CONF."

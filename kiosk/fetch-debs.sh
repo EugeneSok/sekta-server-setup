@@ -62,8 +62,9 @@ PKGS+=(sudo)
 # multi-screen kiosk (kiosk-screens.sh): wmctrl — windows of one Chromium on
 # their screens (X11); wlr-randr — screen layout on labwc/wayfire
 PKGS+=(wmctrl)
-# sekta-kiosk app: zenity windows, pkexec to switch GDM Wayland/Xorg
-for p in zenity pkexec; do
+# sekta-kiosk app: its window (python3-gi + GTK 4), zenity (the fallback
+# windows), pkexec to switch GDM Wayland/Xorg
+for p in python3-gi python3-gi-cairo gir1.2-gtk-4.0 zenity pkexec; do
   if apt-cache show "$p" >/dev/null 2>&1; then PKGS+=("$p"); fi
 done
 if apt-cache show wlr-randr >/dev/null 2>&1; then PKGS+=(wlr-randr); fi

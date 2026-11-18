@@ -44,6 +44,7 @@ AUTOSTART_MARK="# sekta-kiosk"
 SCREENS_BIN="$HOME/.local/bin/sekta-kiosk-screens"
 SCREENS_CONF="$HOME/.config/sekta-kiosk/screens.conf"
 APP_BIN="$HOME/.local/bin/sekta-kiosk"   # sekta-kiosk app, as in install.sh
+GUI_BIN="$HOME/.local/bin/sekta-kiosk-gui"   # its GTK window
 
 info()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -59,6 +60,8 @@ ls "$DEBS_DIR"/*.deb >/dev/null 2>&1 || \
 for asset in logo.png bar_track.png bar_fill.png kiosk-screens.sh sekta-kiosk.sh; do
   [ -f "$HERE/$asset" ] || die "Missing local asset: $asset (offline install needs it bundled)."
 done
+# the app's GTK window — without it the app shows zenity windows
+[ -f "$HERE/sekta-kiosk-gui.py" ] || warn "No sekta-kiosk-gui.py — the sekta-kiosk app falls back to zenity windows."
 # only the menu icon — without it the app gets a generic one
 [ -f "$HERE/sekta-kiosk.png" ] || warn "No sekta-kiosk.png — the menu entry gets a generic icon."
 
@@ -202,7 +205,7 @@ if detect_existing; then
     done
     systemctl --user daemon-reload 2>/dev/null || true
     if [ -x "$APP_BIN" ]; then "$APP_BIN" --unintegrate 2>/dev/null || true; fi
-    rm -f "$LAUNCHER" "$XDG_AUTOSTART" "$SCREENS_BIN" "$SCREENS_CONF" "$APP_BIN"
+    rm -f "$LAUNCHER" "$XDG_AUTOSTART" "$SCREENS_BIN" "$SCREENS_CONF" "$APP_BIN" "$GUI_BIN"
     [ -f "$LABWC_AUTOSTART" ] && sed -i "/$AUTOSTART_MARK\$/d" "$LABWC_AUTOSTART"
     [ -d "$THEME_DIR" ] && sudo rm -rf "$THEME_DIR"
     info "Previous install removed."
@@ -240,7 +243,7 @@ APT_LOCAL=(-o Dir::Etc::SourceList="$REPO/sources.list" -o Dir::Etc::SourceParts
            -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= -o Acquire::Languages=none)
 WANT=()
 for p in plymouth plymouth-themes chromium chromium-browser x11-xserver-utils \
-         keyboard-configuration console-setup wmctrl wlr-randr zenity pkexec; do
+         keyboard-configuration console-setup wmctrl wlr-randr python3-gi python3-gi-cairo gir1.2-gtk-4.0 zenity pkexec; do
   if grep -x "Package: $p" "$REPO/Packages" >/dev/null; then WANT+=("$p"); fi
 done
 sudo apt-get "${APT_LOCAL[@]}" update -qq || { sudo rm -rf "$REPO"; die "Could not read the bundled packages ($DEBS_DIR)."; }
@@ -366,6 +369,11 @@ systemctl --user stop "$SERVICE" 2>/dev/null || true
 mkdir -p "$(dirname "$SCREENS_BIN")"
 install -m 755 "$HERE/kiosk-screens.sh" "$SCREENS_BIN.new" && mv -f "$SCREENS_BIN.new" "$SCREENS_BIN"
 install -m 755 "$HERE/sekta-kiosk.sh" "$APP_BIN.new" && mv -f "$APP_BIN.new" "$APP_BIN"
+if [ -f "$HERE/sekta-kiosk-gui.py" ]; then
+  install -m 755 "$HERE/sekta-kiosk-gui.py" "$GUI_BIN.new" && mv -f "$GUI_BIN.new" "$GUI_BIN"
+else
+  rm -f "$GUI_BIN"   # an older window must not drive the new launcher: zenity
+fi
 KIOSK_SCREENS="$SCREENS" KIOSK_URL="${URLS[*]}" KIOSK_LAYOUT="${LAYOUT[*]}" \
   KIOSK_OUTPUTS="${OUTPUTS[*]}" KIOSK_CHROMIUM="$CHROMIUM_BIN" \
   "$SCREENS_BIN" --write-conf || die "Could not write $SCREENS_CONF."

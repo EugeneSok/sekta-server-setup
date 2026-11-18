@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # build-deb.sh — build the OFFLINE Debian package sekta-kiosk: the sekta-kiosk
-# app (zenity windows) + the kiosk installer + every package it needs
-# (fetch-debs.sh bundle: chromium, plymouth, zenity, wmctrl, … with all
+# app (GTK 4 window, zenity fallback) + the kiosk installer + every package it needs
+# (fetch-debs.sh bundle: chromium, plymouth, GTK 4, zenity, wmctrl, … with all
 # dependencies). The package has no dependencies of its own, so it installs on
 # a machine with no network:
 #
@@ -31,7 +31,7 @@ VERSION="$(cat "$HERE/VERSION")"
 info() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
-FILES=(install-offline.sh kiosk-screens.sh sekta-kiosk.sh fetch-debs.sh
+FILES=(install-offline.sh kiosk-screens.sh sekta-kiosk.sh sekta-kiosk-gui.py fetch-debs.sh
        logo.png bar_track.png bar_fill.png sekta-kiosk.png VERSION)
 
 if [ "${1:-}" != "--local" ]; then
@@ -64,8 +64,9 @@ release="$( . /etc/os-release; echo "${VERSION_CODENAME:-unknown}")"
 arch="$(dpkg --print-architecture)"
 bn="$release-$arch"
 
-# no bundle yet, or one made before sudo joined fetch-debs.sh PKGS
-if [ ! -f "$HERE/debs/$bn/BUNDLE" ] || ! ls "$HERE/debs/$bn"/sudo_*.deb >/dev/null 2>&1; then
+# no bundle yet, or one made before sudo / GTK 4 joined fetch-debs.sh PKGS
+if [ ! -f "$HERE/debs/$bn/BUNDLE" ] || ! ls "$HERE/debs/$bn"/sudo_*.deb >/dev/null 2>&1 \
+   || ! ls "$HERE/debs/$bn"/python3-gi-cairo_*.deb >/dev/null 2>&1; then
   info "Fetching the package bundle debs/$bn…"
   bash "$HERE/fetch-debs.sh"
 fi

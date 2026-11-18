@@ -127,9 +127,13 @@ reset, opens the configured sites. Reinstalling resets too, so new sites apply.
 ## Sekta kiosk app (screens and sites later)
 
 The browser kiosk installs a small app, **«Sekta kiosk — екрани»**
-(`~/.local/bin/sekta-kiosk`, zenity windows): open it from the app menu or with
-**Ctrl+Alt+K** — also over the full-screen kiosk (GNOME shortcut; the dialogs
-stay on top on X11). On labwc / wayfire (Raspberry Pi OS) there is no hotkey —
+(`~/.local/bin/sekta-kiosk`): open it from the app menu or with **Ctrl+Alt+K** —
+also over the full-screen kiosk (GNOME shortcut; the window stays on top on
+X11). Its window is `sekta-kiosk-gui` (Python + GTK 4, light olive theme with the
+SEKTA logo): the screens drawn as they stand around screen 1, the selected
+screen's settings beside them, one «Застосувати» for all changes. Without
+`python3-gi` / GTK 4 — or with `SEKTA_KIOSK_ZENITY=1` — the same app runs in
+zenity windows. On labwc / wayfire (Raspberry Pi OS) there is no hotkey —
 run `sekta-kiosk` from a terminal or `DISPLAY=:0 ~/.local/bin/sekta-kiosk` over ssh.
 
 The kiosk owns the display user's Chromium: screen 1 uses the default profile,
@@ -137,9 +141,10 @@ The kiosk owns the display user's Chromium: screen 1 uses the default profile,
 screens on X11 a Chromium opened by hand is closed when the kiosk starts — use
 a dedicated user for the display.
 
-- **Екрани й сайти** — add / remove a screen (up to 3), pick its output
-  (`авто` or a name like `HDMI-2`), where it stands (clock hour around screen 1)
-  and its site; one screen may hold several sites as tabs. «Застосувати» writes
+- **Екрани й сайти** (the main window) — add / remove a screen (up to 3);
+  «Змінити екран» (or a double click on it): its site, output (`авто` or a
+  name like `HDMI-2`), where it stands (a click on the clock hour around
+  screen 1) and its zoom; one screen may hold several sites as tabs. «Застосувати» writes
   `screens.conf` and restarts the kiosk; new sites reset the remembered pages.
   Going from one screen to several switches GNOME to Xorg (`pkexec`, admin
   password) and offers a reboot; back to one screen gives Wayland back.
@@ -189,22 +194,27 @@ systemctl --user status sekta-kiosk.service      # Sekta APP
 ## Offline package (Debian, no network)
 
 One `.deb` per release and arch with everything inside — the sekta-kiosk app,
-the installer and all packages it needs (Chromium, Plymouth, zenity, wmctrl…
+the installer and all packages it needs (Chromium, Plymouth, GTK 4 for the app window, zenity, wmctrl…
 with dependencies). The package has no dependencies of its own:
 
 Double-click the `.deb` → «Програми» (GNOME Software) opens its page (name,
 SEKTA icon, description) → «Встановити». Or in a terminal:
 
 ```bash
-sudo apt install ./sekta-kiosk_1.1.0+bookworm_amd64.deb   # no network needed
+sudo apt install ./sekta-kiosk_<version>+bookworm_amd64.deb   # no network needed
 ```
 
 Then **«Sekta kiosk»** in the app menu (or `sekta-kiosk` in a terminal):
 
-- first start: installs the bundled packages (no zenity yet → a terminal opens,
-  sudo password there), then asks screens and sites in windows and installs
+- first start: installs the bundled packages (no GTK 4 / zenity yet → a terminal
+  opens, sudo password there), then asks screens and sites in the window and installs
   the kiosk (everything of pve-setup item 7); reboot;
 - later starts (menu, Ctrl+Alt+K): the screen manager above;
+- **update from a file:** menu «Оновити з файлу (.deb)» → pick
+  `sekta-kiosk_<ver>+<release>_<arch>.deb` on the stick (the window opens in
+  `/media/<user>`) → the app checks it is sekta-kiosk for this release and
+  arch, shows installed → new version, installs it (password in a window) and updates the kiosk with the new
+  package's installer; the same version = reinstall, an older one asks first;
 - a newer package installed over it: the app offers to update the kiosk —
   screens, sites and the open pages stay; «Перевстановити kiosk» in the menu
   repairs a broken install with the same version.
