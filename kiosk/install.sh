@@ -2,8 +2,8 @@
 #
 # SEKTA kiosk — one-command installer (Plymouth splash + Chromium or Sekta APP kiosk)
 #
-#   1) Plymouth boot splash with a centered logo (from 1.md)
-#   2) Chromium kiosk autostart via a systemd --user unit (from 2.md)
+#   1) Plymouth boot splash with a centered logo
+#   2) Chromium kiosk autostart via a systemd --user unit
 #
 # Run on Debian/Raspberry Pi OS as a NORMAL user (it calls sudo itself):
 #
